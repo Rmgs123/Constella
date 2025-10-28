@@ -229,10 +229,22 @@ async def join(req):
     if not valid:
         return web.json_response({"ok": False, "reason": "invalid/expired token"}, status=403)
 
-    # регистрируем нового пира
-    new_peer = {"name": name, "addr": pub_addr, "node_id": "", "status": "alive", "last_seen": now_s()}
-    # node_id узнаем по health позже
+    # Регистрируем нового пира
+    new_peer = {
+        "name": name,
+        "addr": pub_addr,
+        "node_id": "",
+        "status": "alive",
+        "last_seen": now_s()
+    }
     upsert_peer(new_peer)
+
+    # Обновляем состояние в памяти и на диске
+    print(f"[join] accepted new peer {name} ({pub_addr})")
+    save_json(STATE_FILE, state)
+
+    # Рассылаем остальным пинг, чтобы они увидели нового участника
+    asyncio.create_task(propagate_new_peer(new_peer))
 
     return web.json_response({
         "ok": True,
@@ -241,6 +253,7 @@ async def join(req):
         "network_secret": state.get("network_secret"),
         "peers": state.get("peers", [])
     })
+
 
 @routes.post("/rpc")
 async def rpc(req):
@@ -272,6 +285,22 @@ async def rpc(req):
         return web.json_response({"ok": True, "message": "rebooting"})
     else:
         return web.json_response({"ok": False, "error": "unknown method"}, status=400)
+
+async def propagate_new_peer(new_peer):
+    """Рассылаем информацию о новом пире всем живым узлам"""
+    await asyncio.sleep(0.3)
+    for p in get_alive_peers():
+        if p["addr"] == new_peer["addr"]:
+            continue
+        try:
+            await call_rpc(
+                p["addr"],
+                "GetPeers",
+                {"note": f"new peer {new_peer['name']}"}
+            )
+        except Exception as e:
+            print(f"[propagate] failed to contact {p['addr']}: {e}")
+
 
 async def async_reboot():
     await asyncio.sleep(0.2)
