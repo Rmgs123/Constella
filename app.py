@@ -347,34 +347,57 @@ def parse_join_url(u: str) -> Tuple[str, Dict[str, str]]:
     return host, qs
 
 async def do_join_if_needed():
+    # Если уже есть непустой state -> не делаем join
     if os.path.exists(STATE_FILE):
-        # уже в сети
-        return
+        try:
+            st = load_json(STATE_FILE, {})
+            if st.get("network_id"):
+                return
+        except Exception:
+            pass
+
     if not JOIN_URL:
         # режим init — state должен быть уже создан install.sh init-ом
         return
+
     seed, qs = parse_join_url(JOIN_URL)
-    net = qs.get("net","")
-    token = qs.get("token","")
+    net = qs.get("net", "")
+    token = qs.get("token", "")
     if not net or not token:
-        print("JOIN_URL missing net/token", file=sys.stderr); return
-    payload = {"name": SERVER_NAME, "token": token, "network_id": net, "public_addr": PUBLIC_ADDR}
+        print("JOIN_URL missing net/token", file=sys.stderr)
+        return
+
+    payload = {
+        "name": SERVER_NAME,
+        "token": token,
+        "network_id": net,
+        "public_addr": PUBLIC_ADDR,
+    }
+
     try:
         async with http_client.post(f"http://{seed}/join", json=payload, timeout=ClientTimeout(total=8)) as r:
             data = await r.json()
     except Exception as e:
-        print("join error:", e, file=sys.stderr); return
+        print("join error:", e, file=sys.stderr)
+        return
+
     if not data.get("ok"):
-        print("join refused:", data, file=sys.stderr); return
-    # записываем общее состояние
+        print("join refused:", data, file=sys.stderr)
+        return
+
+    # записываем state
     set_state("network_id", data["network_id"])
     set_state("owner_username", data["owner_username"])
     set_state("network_secret", data["network_secret"])
     set_state("peers", data.get("peers", []))
-    # добавим seed в peers, если его там нет
-    present = any(p.get("addr")==seed for p in state["peers"])
+
+    # добавим seed в peers, если его нет
+    present = any(p.get("addr") == seed for p in state["peers"])
     if not present:
         upsert_peer({"name": seed, "addr": seed, "node_id": "", "status": "unknown", "last_seen": 0})
+
+    print(f"[join] Joined network {data['network_id']} via {seed}")
+
 
 # ----------------------------
 # Telegram бот (aiogram v3)
