@@ -1,0 +1,44 @@
+# IDE
+.idea/
+.vscode/
+
+# Virtual envs
+venv/
+.venv/
+ENV/
+env/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Coverage / tests
+.coverage
+.coverage.*
+htmlcov/
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Runtime state (может содержать секреты токенов/ключей)
+state/
+
+# OS junk
+.DS_Store
+Thumbs.db
