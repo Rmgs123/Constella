@@ -347,6 +347,8 @@ def parse_join_url(u: str) -> Tuple[str, Dict[str, str]]:
     return host, qs
 
 async def do_join_if_needed():
+    print("[join] checking join conditions...")
+
     # Если уже есть непустой state -> не делаем join
     if os.path.exists(STATE_FILE):
         try:
@@ -376,6 +378,7 @@ async def do_join_if_needed():
 
     try:
         async with http_client.post(f"http://{seed}/join", json=payload, timeout=ClientTimeout(total=8)) as r:
+            print(f"[join] sending join to {seed}…")
             data = await r.json()
     except Exception as e:
         print("join error:", e, file=sys.stderr)
