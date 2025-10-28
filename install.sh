@@ -37,8 +37,8 @@ if [[ "$cmd" == "init" ]]; then
   done
   [[ -z "$SERVER_NAME" || -z "$PUBLIC_ADDR" || -z "$OWNER" || -z "$BOT_TOKEN" ]] && { red "Missing args"; usage; exit 1; }
 
-  NETWORK_ID=$(head -c16 /dev/urandom | xxd -p)
-  NETWORK_SECRET=$(head -c32 /dev/urandom | xxd -p)
+  NETWORK_ID=$(openssl rand -hex 16)
+  NETWORK_SECRET=$(openssl rand -hex 32)
 
   cat > .env <<EOF
 SERVER_NAME=${SERVER_NAME}
