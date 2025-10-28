@@ -8,5 +8,6 @@ services:
       - ./state:/app/state
     ports:
       - "4747:4747"
-    # нужно для перезагрузки узла (host), см. README/ТЗ:
-    privileged: true
+
+    privileged: true        # разрешаем контейнеру доступ к системным вызовам
+    pid: "host"             # делим PID-пространство с хостом (позволяет reboot/shutdown)
