@@ -226,4 +226,3 @@ CLI команды: `status`, `peers`, `invite`, `leave`
 * RBAC и аудит-лог.
 * Смена владельца через CLI.
 * NAT-traversal (WireGuard/libp2p).
-* Веб-панель для просмотра узлов.
