@@ -254,6 +254,31 @@ async def join(req):
         "peers": state.get("peers", [])
     })
 
+@routes.post("/announce")
+async def announce(req):
+    """
+    Узел сообщает о себе лидеру/пирам.
+    Тело: { "name": "...", "addr": "host:port", "node_id": "..." }
+    """
+    try:
+        data = await req.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "bad json"}, status=400)
+
+    name = data.get("name", "")
+    addr = data.get("addr", "")
+    node_id = data.get("node_id", "")
+    if not name or not addr:
+        return web.json_response({"ok": False, "error": "bad request"}, status=400)
+
+    upsert_peer({
+        "name": name,
+        "addr": addr,
+        "node_id": node_id or "",
+        "status": "alive",
+        "last_seen": now_s()
+    })
+    return web.json_response({"ok": True})
 
 @routes.post("/rpc")
 async def rpc(req):
@@ -340,25 +365,43 @@ async def heartbeat_loop():
         # 1) опрос известных адресов /health
         for node_id, p in list(peers.items()):
             addr = p.get("addr")
-            if not addr: continue
+            if not addr:
+                continue
             try:
                 async with http_client.get(f"http://{addr}/health", timeout=ClientTimeout(total=RPC_TIMEOUT)) as r:
                     if r.status == 200:
                         data = await r.json()
-                        nid = data.get("node_id","")
+                        nid = data.get("node_id", "")
                         nm = data.get("name", p.get("name"))
                         info = {"name": nm, "addr": addr, "node_id": nid, "status": "alive", "last_seen": now_s()}
                         upsert_peer(info)
                     else:
-                        # ошибка — пометим offline (через last_seen)
+                        # ошибка — пусть last_seen устареет
                         pass
             except Exception:
-                # нет ответа — просто дадим last_seen устареть
+                # нет ответа — пусть last_seen устареет
                 pass
 
-        # 2) вычислим лидера и периодически обновим self_peer
+        # 2) обновим локальное представление себя (для /peers)
         self_peer.update({"addr": PUBLIC_ADDR, "last_seen": now_s(), "status": "alive"})
+
+        # 2b) ОБЪЯВЛЕНИЕ СЕБЯ ДРУГИМ УЗЛАМ (announce) — ВСТАВЛЕНО ЗДЕСЬ
+        targets = {p.get("addr") for p in state.get("peers", []) if p.get("addr")}
+        myaddr = PUBLIC_ADDR
+        if myaddr in targets:
+            targets.discard(myaddr)
+        for addr in list(targets):
+            try:
+                await http_client.post(
+                    f"http://{addr}/announce",
+                    json={"name": SERVER_NAME, "addr": PUBLIC_ADDR, "node_id": NODE_ID},
+                    timeout=ClientTimeout(total=RPC_TIMEOUT)
+                )
+            except Exception:
+                pass
+
         await asyncio.sleep(HEARTBEAT_INTERVAL)
+
 
 # ----------------------------
 # JOIN (если узел впервые стартует с JOIN_URL)
