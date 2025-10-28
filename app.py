@@ -381,7 +381,7 @@ async def start_bot():
             u = (m.from_user.username or "").lower()
             if u.lower() != owner.lower():
                 return  # игнор других
-            return await handler(m, *a, **k)
+            return await handler(m)
         return wrapper
 
     @dp.message(Command("start"))
