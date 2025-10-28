@@ -18,29 +18,34 @@ Notes:
 EOF
 }
 
+need_bin(){ command -v "$1" >/dev/null 2>&1 || { red "Missing binary: $1"; exit 1; }; }
+
 cmd=${1:-""}
 shift || true
 
-if [[ "$cmd" == "init" ]]; then
-  SERVER_NAME=""
-  PUBLIC_ADDR=""
-  OWNER=""
-  BOT_TOKEN=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --server-name) SERVER_NAME="$2"; shift 2;;
-      --public-addr) PUBLIC_ADDR="$2"; shift 2;;
-      --owner) OWNER="$2"; shift 2;;
-      --bot-token) BOT_TOKEN="$2"; shift 2;;
-      *) red "Unknown arg $1"; usage; exit 1;;
-    esac
-  done
-  [[ -z "$SERVER_NAME" || -z "$PUBLIC_ADDR" || -z "$OWNER" || -z "$BOT_TOKEN" ]] && { red "Missing args"; usage; exit 1; }
+case "$cmd" in
+  init)
+    SERVER_NAME=""
+    PUBLIC_ADDR=""
+    OWNER=""
+    BOT_TOKEN=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --server-name) SERVER_NAME="$2"; shift 2;;
+        --public-addr) PUBLIC_ADDR="$2"; shift 2;;
+        --owner)       OWNER="$2"; shift 2;;
+        --bot-token)   BOT_TOKEN="$2"; shift 2;;
+        *) red "Unknown arg $1"; usage; exit 1;;
+      esac
+    done
+    [[ -z "$SERVER_NAME" || -z "$PUBLIC_ADDR" || -z "$OWNER" || -z "$BOT_TOKEN" ]] && { red "Missing args"; usage; exit 1; }
 
-  NETWORK_ID=$(openssl rand -hex 16)
-  NETWORK_SECRET=$(openssl rand -hex 32)
+    need_bin openssl
 
-  cat > .env <<EOF
+    NETWORK_ID=$(openssl rand -hex 16)
+    NETWORK_SECRET=$(openssl rand -hex 32)
+
+    cat > .env <<EOF
 SERVER_NAME=${SERVER_NAME}
 LISTEN_ADDR=0.0.0.0:4747
 PUBLIC_ADDR=${PUBLIC_ADDR}
@@ -55,8 +60,8 @@ SEED_PEERS=
 JOIN_URL=
 EOF
 
-  mkdir -p state
-  cat > state/network_state.json <<EOF
+    mkdir -p state
+    cat > state/network_state.json <<EOF
 {
   "network_id": "${NETWORK_ID}",
   "owner_username": "${OWNER}",
@@ -64,23 +69,32 @@ EOF
   "peers": []
 }
 EOF
-  green "Init ready. Run: docker compose up -d --build"
+    green "Init ready. Run: docker compose up -d --build"
+    ;;
 
-elif [[ "$cmd" == "join" ]]; then
-  SERVER_NAME=""
-  JOIN_URL=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --server-name) SERVER_NAME="$2"; shift 2;;
-      --join) JOIN_URL="$2"; shift 2;;
-      *) red "Unknown arg $1"; usage; exit 1;;
-    esac
-  done
-  [[ -z "$SERVER_NAME" || -z "$JOIN_URL" ]] && { red "Missing args"; usage; exit 1; }
-  cat > .env <<EOF
+  join)
+    SERVER_NAME=""
+    JOIN_URL=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --server-name) SERVER_NAME="$2"; shift 2;;
+        --join)        JOIN_URL="$2"; shift 2;;
+        *) red "Unknown arg $1"; usage; exit 1;;
+      esac
+    done
+    [[ -z "$SERVER_NAME" || -z "$JOIN_URL" ]] && { red "Missing args"; usage; exit 1; }
+
+    # Пытаемся определить публичный IP; fallback на первый локальный
+    PUB_IP=$( (curl -4s --max-time 3 ifconfig.co || true) | tr -d '\n' )
+    if [[ -z "$PUB_IP" ]]; then
+      PUB_IP=$(hostname -I | awk '{print $1}')
+    fi
+    PUBLIC_ADDR="${PUB_IP}:4747"
+
+    cat > .env <<EOF
 SERVER_NAME=${SERVER_NAME}
 LISTEN_ADDR=0.0.0.0:4747
-PUBLIC_ADDR=$(hostname -I | awk '{print $1}'):4747
+PUBLIC_ADDR=${PUBLIC_ADDR}
 
 OWNER_USERNAME=
 BOT_TOKEN=
@@ -91,10 +105,13 @@ NETWORK_SECRET=
 SEED_PEERS=
 JOIN_URL=${JOIN_URL}
 EOF
-  mkdir -p state
-  green "Join ready. Run: docker compose up -d --build"
 
-else
-  usage
-  exit 1
-fi
+    mkdir -p state
+    green "Join ready. Run: docker compose up -d --build"
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac

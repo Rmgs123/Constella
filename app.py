@@ -175,6 +175,26 @@ async def health(req):
 async def get_peers_http(req):
     return web.json_response({"peers": state.get("peers", [])})
 
+@routes.get("/join_handshake")
+async def join_handshake(req):
+    """
+    Read-only рукопожатие: отдаём базовую сетевую инфу,
+    чтобы новый узел мог сверить сетевые настройки до фактического join.
+    """
+    qs = req.rel_url.query
+    net = qs.get("net", "")
+    # опционально сверяем network_id, если задан
+    if net and state.get("network_id") and net != state["network_id"]:
+        return web.json_response({"ok": False, "reason": "wrong network"}, status=403)
+
+    return web.json_response({
+        "ok": True,
+        "network_id": state.get("network_id"),
+        "owner_username": state.get("owner_username"),
+        "seed_peers": [p.get("addr") for p in state.get("peers", []) if p.get("addr")] or ([PUBLIC_ADDR] if PUBLIC_ADDR else []),
+    })
+
+
 @routes.post("/join")
 async def join(req):
     """
