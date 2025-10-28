@@ -4,7 +4,7 @@ services:
     container_name: constella-node
     restart: always
     env_file:
-      - .env
+      - ./.env
     volumes:
       - ./state:/app/state
       - /usr/bin/nsenter:/usr/bin/nsenter:ro
