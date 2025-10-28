@@ -6,10 +6,7 @@ services:
     env_file: .env
     volumes:
       - ./state:/app/state
-      - /sbin/reboot:/sbin/reboot:ro
-      - /sbin/shutdown:/sbin/shutdown:ro
-      - /sbin/init:/sbin/init:ro
-      - /bin/systemctl:/bin/systemctl:ro
+      - /usr/bin/nsenter:/usr/bin/nsenter:ro
     ports:
       - "4747:4747"
 
