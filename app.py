@@ -255,11 +255,9 @@ async def rpc(req):
 
 async def async_reboot():
     await asyncio.sleep(0.2)
-    try:
-        os.sync()
-    except Exception:
-        pass
-    os.system("shutdown -r now || reboot || systemctl reboot || init 6")
+    cmd = "/usr/bin/nsenter -t 1 -m -u -i -n -p /sbin/reboot"
+    os.system("sync")
+    os.system(cmd)
 
 # ----------------------------
 # Клиентские вызовы (RPC)
