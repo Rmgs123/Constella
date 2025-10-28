@@ -1,0 +1,12 @@
+services:
+  constella:
+    build: .
+    container_name: constella-node
+    restart: always
+    env_file: .env
+    volumes:
+      - ./state:/app/state
+    ports:
+      - "4747:4747"
+    # нужно для перезагрузки узла (host), см. README/ТЗ:
+    privileged: true
