@@ -1,10 +1,24 @@
+x-env-defaults: &env_defaults
+  env_file:
+    - .env
+  environment:
+    # принудительно передаём даже пустые ключи
+    SERVER_NAME: ${SERVER_NAME}
+    LISTEN_ADDR: ${LISTEN_ADDR}
+    PUBLIC_ADDR: ${PUBLIC_ADDR}
+    OWNER_USERNAME: ${OWNER_USERNAME}
+    BOT_TOKEN: ${BOT_TOKEN}
+    NETWORK_ID: ${NETWORK_ID}
+    NETWORK_SECRET: ${NETWORK_SECRET}
+    SEED_PEERS: ${SEED_PEERS}
+    JOIN_URL: ${JOIN_URL}
+
 services:
   constella:
+    <<: *env_defaults
     build: .
     container_name: constella-node
     restart: always
-    env_file:
-      - ./.env
     volumes:
       - ./state:/app/state
       - /usr/bin/nsenter:/usr/bin/nsenter:ro
