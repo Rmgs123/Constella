@@ -130,17 +130,15 @@ def get_alive_peers() -> List[Dict[str, Any]]:
     return alive
 
 def compute_leader_key(p: Dict[str, Any]) -> Tuple[int, str]:
-    priority = p.get("priority", 0)
-    return (priority, p.get("node_id",""))
+    return (int(p.get("priority", 0) or 0), p.get("node_id",""))
 
 def current_leader() -> Dict[str, Any]:
-    alive = get_alive_peers()
-    # включаем себя явно
-    alive_ids = {p["node_id"] for p in alive}
-    if self_peer["node_id"] not in alive_ids:
-        alive.append(self_peer)
-    leader = min(alive, key=compute_leader_key)
-    return leader
+    candidates = [p for p in peers_with_status() if p.get("status") == "alive"]
+    # включаем себя, если вдруг не попали
+    if not any(p.get("node_id") == NODE_ID for p in candidates):
+        me = dict(self_peer); me["status"] = "alive"
+        candidates.append(me)
+    return min(candidates, key=compute_leader_key)
 
 def i_am_leader() -> bool:
     L = current_leader()
@@ -173,7 +171,7 @@ async def health(req):
 
 @routes.get("/peers")
 async def get_peers_http(req):
-    return web.json_response({"peers": state.get("peers", [])})
+    return web.json_response({"peers": peers_with_status()})
 
 @routes.get("/join_handshake")
 async def join_handshake(req):
@@ -237,6 +235,11 @@ async def join(req):
         "status": "alive",
         "last_seen": now_s()
     }
+
+    peers_list = state.get("peers", [])
+    peers_list.append({"name": name, "addr": pub_addr, "node_id": "", "status": "alive", "last_seen": now_s()})
+    set_state("peers", peers_list)
+
     upsert_peer(new_peer)
 
     # Обновляем состояние в памяти и на диске
@@ -256,29 +259,23 @@ async def join(req):
 
 @routes.post("/announce")
 async def announce(req):
-    """
-    Узел сообщает о себе лидеру/пирам.
-    Тело: { "name": "...", "addr": "host:port", "node_id": "..." }
-    """
     try:
         data = await req.json()
     except Exception:
         return web.json_response({"ok": False, "error": "bad json"}, status=400)
 
-    name = data.get("name", "")
-    addr = data.get("addr", "")
-    node_id = data.get("node_id", "")
+    name = data.get("name","")
+    addr = data.get("addr","")
+    node_id = data.get("node_id","")
     if not name or not addr:
         return web.json_response({"ok": False, "error": "bad request"}, status=400)
 
     upsert_peer({
-        "name": name,
-        "addr": addr,
-        "node_id": node_id or "",
-        "status": "alive",
-        "last_seen": now_s()
+        "name": name, "addr": addr, "node_id": node_id or "",
+        "status": "alive", "last_seen": now_s()
     })
     return web.json_response({"ok": True})
+
 
 @routes.post("/rpc")
 async def rpc(req):
@@ -294,7 +291,7 @@ async def rpc(req):
     method = payload.get("method","")
     params = payload.get("params", {}) or {}
     if method == "GetPeers":
-        return web.json_response({"ok": True, "peers": state.get("peers", [])})
+        return web.json_response({"ok": True, "peers": peers_with_status()})
     elif method == "GetStats":
         target = params.get("target")
         if target and target not in (SERVER_NAME, NODE_ID):
@@ -385,7 +382,7 @@ async def heartbeat_loop():
         # 2) обновим локальное представление себя (для /peers)
         self_peer.update({"addr": PUBLIC_ADDR, "last_seen": now_s(), "status": "alive"})
 
-        # 2b) ОБЪЯВЛЕНИЕ СЕБЯ ДРУГИМ УЗЛАМ (announce) — ВСТАВЛЕНО ЗДЕСЬ
+        # объявляем себя известным адресам (лидер после рестарта нас увидит)
         targets = {p.get("addr") for p in state.get("peers", []) if p.get("addr")}
         myaddr = PUBLIC_ADDR
         if myaddr in targets:
@@ -402,6 +399,21 @@ async def heartbeat_loop():
 
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
+def peer_status(p: Dict[str, Any]) -> str:
+    last = int(p.get("last_seen", 0) or 0)
+    misses = max(0, int((now_s() - last) // HEARTBEAT_INTERVAL))
+    return "alive" if misses < DOWN_AFTER_MISSES else "offline"
+
+def peers_with_status() -> List[Dict[str, Any]]:
+    # объединяем известных пиров и себя; статусы считаем на лету
+    merged = {p.get("node_id",""): dict(p) for p in state.get("peers", [])}
+    merged[NODE_ID] = dict(self_peer)
+    out = []
+    for nid, p in merged.items():
+        q = dict(p)
+        q["status"] = peer_status(q)
+        out.append(q)
+    return out
 
 # ----------------------------
 # JOIN (если узел впервые стартует с JOIN_URL)
@@ -511,13 +523,15 @@ async def start_bot():
         L = current_leader().get("node_id")
         lines = []
         # соберём последнюю копию
-        lst = {p.get("node_id",""): p for p in state.get("peers", [])}
-        lst[NODE_ID] = self_peer
-        for nid, p in sorted(lst.items(), key=lambda kv: kv[1].get("name","")):
+        lst = peers_with_status()  # вместо state["peers"]
+        L = current_leader().get("node_id")
+        by_id = {p.get("node_id", ""): p for p in lst}
+        lines = []
+        for nid, p in sorted(by_id.items(), key=lambda kv: kv[1].get("name", "")):
             name = p.get("name", nid)
-            status = p.get("status","unknown")
             tag = " — Хост" if nid == L else ""
-            if status != "alive": tag += " (offline)"
+            if p.get("status") != "alive":
+                tag += " (offline)"
             lines.append(f"• {name}{tag}")
         await m.answer("\n".join(lines) if lines else "No nodes")
 
@@ -610,15 +624,17 @@ async def stop_bot():
 async def leader_watcher():
     was_leader = False
     while True:
-        am = i_am_leader()
+        L = current_leader()
+        am = (L.get("node_id") == NODE_ID)
         if am and not was_leader:
-            # стартуем бота
+            print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]})")
             if BOT_TOKEN and state.get("owner_username"):
                 print("[leader] starting bot")
                 await start_bot()
             else:
                 print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
         if (not am) and was_leader:
+            print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
             print("[leader] stopping bot")
             await stop_bot()
         was_leader = am
