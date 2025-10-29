@@ -347,6 +347,33 @@ async def rpc(req):
             return web.json_response({"ok": True})
         return web.json_response({"ok": False, "owner": owner, "until": until})
 
+    elif method == "Lease.Get":
+        lease = state.get("bot_lease", {"owner": "", "until": 0})
+        return web.json_response({"ok": True, "owner": lease.get("owner", ""), "until": lease.get("until", 0)})
+
+    elif method == "Lease.Acquire":
+        want = params.get("owner", "")
+        ttl = int(params.get("ttl", BOT_LEASE_TTL))
+        nowt = now_s()
+        lease = state.get("bot_lease", {"owner": "", "until": 0})
+        # если истёк или свободен — отдаём
+        if not lease.get("owner") or lease.get("until", 0) <= nowt or lease.get("owner") == want:
+            lease = {"owner": want, "until": nowt + ttl}
+            state["bot_lease"] = lease
+            save_json(STATE_FILE, state)
+            return web.json_response({"ok": True, "owner": lease["owner"], "until": lease["until"]})
+        else:
+            return web.json_response({"ok": False, "owner": lease.get("owner", ""), "until": lease.get("until", 0)})
+
+    elif method == "Lease.Release":
+        who = params.get("owner", "")
+        lease = state.get("bot_lease", {"owner": "", "until": 0})
+        if lease.get("owner") == who:
+            state["bot_lease"] = {"owner": "", "until": 0}
+            save_json(STATE_FILE, state)
+            return web.json_response({"ok": True})
+        return web.json_response({"ok": True})  # идемпотентно
+
     else:
         return web.json_response({"ok": False, "error": "unknown method"}, status=400)
 
@@ -358,6 +385,15 @@ async def try_acquire_lease(addr: str, candidate: str, ttl: int):
 
 async def release_lease(addr: str, candidate: str):
     return await call_rpc(addr, "ReleaseLease", {"candidate": candidate})
+
+async def lease_get_from(coord_addr: str) -> Dict[str, Any]:
+    return await call_rpc(coord_addr, "Lease.Get", {})
+
+async def lease_acquire_from(coord_addr: str, owner: str, ttl: int) -> Dict[str, Any]:
+    return await call_rpc(coord_addr, "Lease.Acquire", {"owner": owner, "ttl": ttl})
+
+async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
+    return await call_rpc(coord_addr, "Lease.Release", {"owner": owner})
 
 async def propagate_new_peer(new_peer):
     """Рассылаем информацию о новом пире всем живым узлам"""
@@ -726,73 +762,70 @@ async def leader_watcher():
         L = current_leader()
         am = (L.get("node_id") == NODE_ID)
 
-        # === Мы стали лидером (переход из non-leader -> leader)
         if am and not was_leader:
             print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]}); grace={LEADER_GRACE_SEC}s")
-
-            # Подождать grace-время, чтобы старый лидер успел остановить polling
             t0 = time.time()
             while time.time() - t0 < LEADER_GRACE_SEC:
-                # если за время ожидания лидерство ушло — выходим без старта бота
                 if current_leader().get("node_id") != NODE_ID:
                     break
                 await asyncio.sleep(0.5)
             else:
-                # grace-окно прошло и мы всё ещё лидер
                 if BOT_TOKEN and state.get("owner_username"):
-                    # 1) Проверяем активный lease у других
-                    alive = get_alive_peers()
-                    targets = sorted({p.get("addr") for p in alive if p.get("addr")})
-                    for addr in targets:
-                        r = await get_lease(addr)
-                        if r.get("ok") and r.get("owner") and r.get("owner") != NODE_ID and int(r.get("until", 0)) > now_s():
-                            print(f"[lease] another owner active at {addr}: {r.get('owner')[:8]} until {r.get('until')}")
-                            break
-                    else:
-                        # 2) Пытаемся захватить lease у всех доступных пиров
-                        ok_count = 0
-                        for addr in targets:
-                            r = await try_acquire_lease(addr, NODE_ID, BOT_LEASE_TTL)
-                            if r.get("ok"):
-                                ok_count += 1
-                            else:
-                                print(f"[lease] denied by {addr}: owner={r.get('owner','')[:8]} until={r.get('until')}")
-                        # 3) Локальный lease как доп. защита
-                        set_bot_lease(NODE_ID, now_s() + BOT_LEASE_TTL)
-
-                        if ok_count or len(targets) == 0:
-                            print("[leader] starting bot (lease acquired)")
-                            await start_bot()
+                    coord = lease_coordinator_peer()
+                    if coord and coord.get("addr"):
+                        # 1) проверяем активный лиз у координатора
+                        info = await lease_get_from(coord["addr"])
+                        nowt = now_s()
+                        if info.get("ok") and info.get("owner") and info.get("until",0) > nowt and info.get("owner") != NODE_ID:
+                            print(f"[lease] another owner active at coordinator {coord['addr']}: {info.get('owner','')[:8]} until {info.get('until')}")
                         else:
-                            print("[leader] lease acquire failed across peers; will retry later")
+                            # 2) пробуем захватить у координатора
+                            got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
+                            if got.get("ok"):
+                                print("[leader] starting bot (lease acquired from coordinator)")
+                                await start_bot()
+                            else:
+                                print(f"[leader] lease denied by coordinator: owner={got.get('owner','')[:8]} until={got.get('until')}")
+                    else:
+                        print("[leader] no coordinator available; will retry later")
                 else:
                     print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
 
-        # === Мы потеряли лидерство (переход leader -> non-leader)
         if (not am) and was_leader:
             print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
             print("[leader] stopping bot")
             await stop_bot()
-            await asyncio.sleep(0.5)  # дать сети и Telegram гарантированно отлипнуть
-            # Освобождаем lease в сети и локально
-            for p in get_alive_peers():
-                addr = p.get("addr")
-                if addr:
-                    await release_lease(addr, NODE_ID)
-            set_bot_lease("", 0)
+            await asyncio.sleep(0.5)
+            # отпускаем lease у координатора (если есть)
+            coord = lease_coordinator_peer()
+            if coord and coord.get("addr"):
+                await lease_release_from(coord["addr"], NODE_ID)
 
-        # === Продление lease, если мы лидер и lease скоро истекает
-        owner, until = get_bot_lease()
-        if am and owner == NODE_ID and until - now_s() < BOT_LEASE_TTL // 2:
-            for p in get_alive_peers():
-                addr = p.get("addr")
-                if not addr:
-                    continue
-                await try_acquire_lease(addr, NODE_ID, BOT_LEASE_TTL)
-            set_bot_lease(NODE_ID, now_s() + BOT_LEASE_TTL)
+        # продление лиза, если мы лидер и владелец
+        coord = lease_coordinator_peer()
+        if am and coord and coord.get("addr"):
+            info = await lease_get_from(coord["addr"])
+            owner = info.get("owner","")
+            until = int(info.get("until",0))
+            if owner == NODE_ID and until - now_s() < BOT_LEASE_TTL // 2:
+                await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
 
         was_leader = am
         await asyncio.sleep(1.0)
+
+def lease_coordinator_peer() -> Optional[Dict[str, Any]]:
+    # координирующий узел — с минимальным node_id среди alive + self
+    alive = get_alive_peers()
+    # включаем себя
+    my = self_peer.copy()
+    my["node_id"] = NODE_ID
+    alive_ids = {p.get("node_id") for p in alive}
+    if NODE_ID not in alive_ids:
+        alive.append(my)
+    if not alive:
+        return None
+    best = min(alive, key=lambda p: p.get("node_id", ""))
+    return best
 
 # ----------------------------
 # HTTP сервер bootstrap
