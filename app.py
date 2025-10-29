@@ -31,6 +31,9 @@ DOWN_AFTER_MISSES = int(os.environ.get("DOWN_AFTER_MISSES", "3"))
 RPC_TIMEOUT = float(os.environ.get("RPC_TIMEOUT", "3.0"))
 CLOCK_SKEW = int(os.environ.get("CLOCK_SKEW", "15"))  # сек, допускаемая рассинхронизация в RPC
 
+# рядом с конфигом
+LEADER_GRACE_SEC = float(os.environ.get("LEADER_GRACE_SEC", str(DOWN_AFTER_MISSES*HEARTBEAT_INTERVAL + 1.0)))
+
 # Вспомогательные
 def now_s() -> int: return int(time.time())
 
@@ -605,9 +608,15 @@ async def start_bot():
 
     async def _run():
         try:
+            await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         except asyncio.CancelledError:
             pass
+        finally:
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
 
     BOT_TASK = asyncio.create_task(_run())
 
@@ -627,18 +636,27 @@ async def leader_watcher():
         L = current_leader()
         am = (L.get("node_id") == NODE_ID)
         if am and not was_leader:
-            print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]})")
-            if BOT_TOKEN and state.get("owner_username"):
-                print("[leader] starting bot")
-                await start_bot()
+            print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]}); grace={LEADER_GRACE_SEC}s")
+            t0 = time.time()
+            while time.time() - t0 < LEADER_GRACE_SEC:
+                if current_leader().get("node_id") != NODE_ID:
+                    break
+                await asyncio.sleep(0.5)
             else:
-                print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
+                if BOT_TOKEN and state.get("owner_username"):
+                    print("[leader] starting bot")
+                    await start_bot()
+                else:
+                    print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
+
         if (not am) and was_leader:
-            print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
+            print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id', '')[:8]})")
             print("[leader] stopping bot")
             await stop_bot()
+
         was_leader = am
         await asyncio.sleep(1.0)
+
 
 # ----------------------------
 # HTTP сервер bootstrap
