@@ -545,9 +545,12 @@ def normalized_owner() -> str:
     u = state.get("owner_username","").strip()
     return u[1:] if u.startswith("@") else u
 
+BOT_TASK: Optional[asyncio.Task] = None
+
 async def start_bot():
     global BOT_TASK
     if BOT_TASK is not None and not BOT_TASK.done():
+        print("[bot] already running; skip")
         return
     from aiogram import Bot, Dispatcher, F, types
     from aiogram.filters import Command
@@ -656,7 +659,21 @@ async def start_bot():
 
     async def _run():
         try:
+            # Жёстко обрубаем все возможные long-poll этим токеном
+            try:
+                await bot.set_webhook(
+                    url="https://example.invalid/constella-cutover",
+                    allowed_updates=[],
+                    drop_pending_updates=True
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)  # дать Telegram применить состояние
+
+            # Возврат в режим long-poll: убираем вебхук и чистим очередь
             await bot.delete_webhook(drop_pending_updates=True)
+
+            # Запуск polling
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
         except asyncio.CancelledError:
             pass
@@ -670,12 +687,37 @@ async def start_bot():
 
 async def stop_bot():
     global BOT_TASK
+
+    # В любом случае сначала переключаем токен в webhook, чтобы обрубить getUpdates "везде"
+    try:
+        from aiogram import Bot as _Bot
+        _tmp_bot = _Bot(BOT_TOKEN)
+        await _tmp_bot.set_webhook(
+            url="https://example.invalid/constella-stop",
+            allowed_updates=[],
+            drop_pending_updates=True
+        )
+        await _tmp_bot.session.close()
+    except Exception:
+        pass
+
+    # Отменяем таск polling
     if BOT_TASK and not BOT_TASK.done():
         BOT_TASK.cancel()
         try:
             await BOT_TASK
         except asyncio.CancelledError:
             pass
+
+    # Снова убираем вебхук — готовим почву следующему лидеру для polling
+    try:
+        from aiogram import Bot as _Bot2
+        _tmp_bot2 = _Bot2(BOT_TOKEN)
+        await _tmp_bot2.delete_webhook(drop_pending_updates=True)
+        await _tmp_bot2.session.close()
+    except Exception:
+        pass
+
     BOT_TASK = None
 
 async def leader_watcher():
@@ -731,6 +773,7 @@ async def leader_watcher():
             print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
             print("[leader] stopping bot")
             await stop_bot()
+            await asyncio.sleep(0.5)  # дать сети и Telegram гарантированно отлипнуть
             # Освобождаем lease в сети и локально
             for p in get_alive_peers():
                 addr = p.get("addr")
