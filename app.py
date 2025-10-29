@@ -576,48 +576,49 @@ async def do_join_if_needed():
 # ----------------------------
 # Telegram бот (aiogram v3)
 # ----------------------------
+
+from typing import Optional
+BOT: Optional["Bot"] = None
+DP: Optional["Dispatcher"] = None
 BOT_TASK: Optional[asyncio.Task] = None
+
 def normalized_owner() -> str:
     u = state.get("owner_username","").strip()
     return u[1:] if u.startswith("@") else u
 
-BOT_TASK: Optional[asyncio.Task] = None
-
 async def start_bot():
-    global BOT_TASK
-    if BOT_TASK is not None and not BOT_TASK.done():
+    global BOT, DP, BOT_TASK
+    if BOT_TASK and not BOT_TASK.done():
         print("[bot] already running; skip")
         return
-    from aiogram import Bot, Dispatcher, F, types
+
+    from aiogram import Bot, Dispatcher, types
     from aiogram.filters import Command
-    bot = Bot(BOT_TOKEN)
-    dp = Dispatcher()
+
+    BOT = Bot(BOT_TOKEN)
+    DP = Dispatcher()
 
     owner = normalized_owner()
     def only_owner(handler):
         async def wrapper(m: types.Message, *a, **k):
             u = (m.from_user.username or "").lower()
             if u.lower() != owner.lower():
-                return  # игнор других
+                return
             return await handler(m)
         return wrapper
 
-    @dp.message(Command("start"))
+    @DP.message(Command("start"))
     @only_owner
     async def cmd_start(m: types.Message):
         await m.answer(f"{APP_NAME} ready. Use /nodes, /stats <name>, /reboot <name>, /invite <ttl>")
 
-    @dp.message(Command("nodes"))
+    @DP.message(Command("nodes"))
     @only_owner
     async def cmd_nodes(m: types.Message):
         L = current_leader().get("node_id")
+        by_id = {p.get("node_id",""): p for p in peers_with_status()}
         lines = []
-        # соберём последнюю копию
-        lst = peers_with_status()  # вместо state["peers"]
-        L = current_leader().get("node_id")
-        by_id = {p.get("node_id", ""): p for p in lst}
-        lines = []
-        for nid, p in sorted(by_id.items(), key=lambda kv: kv[1].get("name", "")):
+        for nid, p in sorted(by_id.items(), key=lambda kv: kv[1].get("name","")):
             name = p.get("name", nid)
             tag = " — Хост" if nid == L else ""
             if p.get("status") != "alive":
@@ -625,7 +626,7 @@ async def start_bot():
             lines.append(f"• {name}{tag}")
         await m.answer("\n".join(lines) if lines else "No nodes")
 
-    @dp.message(Command("stats"))
+    @DP.message(Command("stats"))
     @only_owner
     async def cmd_stats(m: types.Message):
         parts = m.text.strip().split(maxsplit=1)
@@ -650,7 +651,7 @@ async def start_bot():
                f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
         await m.reply(msg, parse_mode="Markdown")
 
-    @dp.message(Command("reboot"))
+    @DP.message(Command("reboot"))
     @only_owner
     async def cmd_reboot(m: types.Message):
         parts = m.text.strip().split(maxsplit=1)
@@ -669,14 +670,13 @@ async def start_bot():
             return await m.reply(f"Error: {res.get('error')}")
         await m.reply(f"Rebooting {target}…")
 
-    @dp.message(Command("invite"))
+    @DP.message(Command("invite"))
     @only_owner
     async def cmd_invite(m: types.Message):
         parts = m.text.strip().split(maxsplit=1)
-        ttl_s = 900  # 15m по умолчанию
+        ttl_s = 900
         if len(parts) == 2:
             arg = parts[1].strip().lower()
-            # простейший парсер: 30s, 15m, 2h
             if arg.endswith("s"): ttl_s = int(arg[:-1])
             elif arg.endswith("m"): ttl_s = int(arg[:-1]) * 60
             elif arg.endswith("h"): ttl_s = int(arg[:-1]) * 3600
@@ -684,9 +684,8 @@ async def start_bot():
                 try: ttl_s = int(arg)
                 except: pass
         tok = secrets.token_urlsafe(16)
-        inv = {"token": tok, "exp_ts": now_s() + ttl_s}
         tokens = invites.get("tokens", [])
-        tokens.append(inv)
+        tokens.append({"token": tok, "exp_ts": now_s() + ttl_s})
         invites["tokens"] = tokens
         save_json(INVITES_FILE, invites)
         host = PUBLIC_ADDR or LISTEN_ADDR
@@ -695,49 +694,50 @@ async def start_bot():
 
     async def _run():
         try:
-            # Жёстко обрубаем все возможные long-poll этим токеном
+            # Забьём любые параллельные getUpdates этим токеном
             try:
-                await bot.set_webhook(
+                await BOT.set_webhook(
                     url="https://example.invalid/constella-cutover",
                     allowed_updates=[],
                     drop_pending_updates=True
                 )
             except Exception:
                 pass
-            await asyncio.sleep(1.0)  # дать Telegram применить состояние
-
-            # Возврат в режим long-poll: убираем вебхук и чистим очередь
-            await bot.delete_webhook(drop_pending_updates=True)
-
-            # Запуск polling
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            await asyncio.sleep(1.0)
+            # Возвращаемся к long-poll: чистый старт
+            await BOT.delete_webhook(drop_pending_updates=True)
+            await DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types())
         except asyncio.CancelledError:
             pass
         finally:
             try:
-                await bot.session.close()
+                await BOT.session.close()
             except Exception:
                 pass
 
     BOT_TASK = asyncio.create_task(_run())
 
 async def stop_bot():
-    global BOT_TASK
-
-    # В любом случае сначала переключаем токен в webhook, чтобы обрубить getUpdates "везде"
+    global BOT, DP, BOT_TASK
+    # 1) Глобально «переключаем» токен в webhook, чтобы обрубить любые getUpdates
     try:
         from aiogram import Bot as _Bot
-        _tmp_bot = _Bot(BOT_TOKEN)
-        await _tmp_bot.set_webhook(
+        _tmp = _Bot(BOT_TOKEN)
+        await _tmp.set_webhook(
             url="https://example.invalid/constella-stop",
             allowed_updates=[],
             drop_pending_updates=True
         )
-        await _tmp_bot.session.close()
+        await _tmp.session.close()
     except Exception:
         pass
 
-    # Отменяем таск polling
+    # 2) Просим polling завершиться корректно и ждём таск
+    try:
+        if DP is not None:
+            DP.stop_polling()
+    except Exception:
+        pass
     if BOT_TASK and not BOT_TASK.done():
         BOT_TASK.cancel()
         try:
@@ -745,16 +745,18 @@ async def stop_bot():
         except asyncio.CancelledError:
             pass
 
-    # Снова убираем вебхук — готовим почву следующему лидеру для polling
+    # 3) Убираем webhook — следующий лидер начнёт polling без конфликта
     try:
         from aiogram import Bot as _Bot2
-        _tmp_bot2 = _Bot2(BOT_TOKEN)
-        await _tmp_bot2.delete_webhook(drop_pending_updates=True)
-        await _tmp_bot2.session.close()
+        _tmp2 = _Bot2(BOT_TOKEN)
+        await _tmp2.delete_webhook(drop_pending_updates=True)
+        await _tmp2.session.close()
     except Exception:
         pass
 
     BOT_TASK = None
+    DP = None
+    BOT = None
 
 async def leader_watcher():
     was_leader = False
@@ -764,6 +766,7 @@ async def leader_watcher():
 
         if am and not was_leader:
             print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]}); grace={LEADER_GRACE_SEC}s")
+            # grace-пауза для гашения старого polling
             t0 = time.time()
             while time.time() - t0 < LEADER_GRACE_SEC:
                 if current_leader().get("node_id") != NODE_ID:
@@ -773,13 +776,11 @@ async def leader_watcher():
                 if BOT_TOKEN and state.get("owner_username"):
                     coord = lease_coordinator_peer()
                     if coord and coord.get("addr"):
-                        # 1) проверяем активный лиз у координатора
                         info = await lease_get_from(coord["addr"])
                         nowt = now_s()
                         if info.get("ok") and info.get("owner") and info.get("until",0) > nowt and info.get("owner") != NODE_ID:
                             print(f"[lease] another owner active at coordinator {coord['addr']}: {info.get('owner','')[:8]} until {info.get('until')}")
                         else:
-                            # 2) пробуем захватить у координатора
                             got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
                             if got.get("ok"):
                                 print("[leader] starting bot (lease acquired from coordinator)")
@@ -796,12 +797,11 @@ async def leader_watcher():
             print("[leader] stopping bot")
             await stop_bot()
             await asyncio.sleep(0.5)
-            # отпускаем lease у координатора (если есть)
             coord = lease_coordinator_peer()
             if coord and coord.get("addr"):
                 await lease_release_from(coord["addr"], NODE_ID)
 
-        # продление лиза, если мы лидер и владелец
+        # Продлеваем lease, если мы лидер и владелец
         coord = lease_coordinator_peer()
         if am and coord and coord.get("addr"):
             info = await lease_get_from(coord["addr"])
