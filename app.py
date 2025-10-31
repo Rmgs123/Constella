@@ -10,6 +10,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from aiogram.types import BufferedInputFile
+from aiogram.exceptions import TelegramBadRequest
+
 # Зарефакторить код
 
 # ----------------------------
@@ -246,6 +249,20 @@ def current_leader() -> Dict[str, Any]:
 def i_am_leader() -> bool:
     L = current_leader()
     return L.get("node_id") == NODE_ID
+
+async def safe_edit(msg, text: str, *, reply_markup=None, parse_mode=None):
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        # Игнорируем "message is not modified"
+        if "message is not modified" in str(e):
+            if reply_markup is not None:
+                try:
+                    await msg.edit_reply_markup(reply_markup)
+                except TelegramBadRequest:
+                    pass
+        else:
+            raise
 
 # ----------------------------
 # Метрики
@@ -767,16 +784,14 @@ async def start_bot():
         return kb.as_markup()
 
     def build_server_menu(name: str) -> types.InlineKeyboardMarkup:
-        # найдём пира
         p = next((x for x in peers_with_status() if x.get("name") == name), None)
         alive = (p and p.get("status") == "alive")
-        is_host = (current_leader().get("node_id") == (p or {}).get("node_id"))
         kb = InlineKeyboardBuilder()
         if alive:
-            kb.button(text="📊 Stats", callback_data="action:stats")
-            kb.button(text="🌐 Network", callback_data="action:net")
-            kb.button(text="📈 Graph", callback_data="action:graphs")
-            kb.button(text="🔄 Reboot", callback_data="action:reboot")
+            kb.button(text="📊 Stats", callback_data=f"action:stats:{name}")
+            kb.button(text="🌐 Network", callback_data=f"action:net:{name}")
+            kb.button(text="📈 Graph", callback_data=f"action:graphs:{name}")
+            kb.button(text="🔄 Reboot", callback_data=f"action:reboot:{name}")
             kb.adjust(2, 2)
         else:
             kb.button(text="Сервер оффлайн", callback_data="noop")
@@ -840,7 +855,7 @@ async def start_bot():
         st = UI.get(q.message.chat.id, {"msg_id": q.message.message_id, "page": 0, "selected": None})
         st["page"] = page
         UI[q.message.chat.id] = st
-        await q.message.edit_text("Выберите сервер:", reply_markup=build_nodes_page(page))
+        await safe_edit(q.message,"Выберите сервер:", reply_markup=build_nodes_page(page))
         await q.answer()
 
     @DP.callback_query(F.data.startswith("server:"))
@@ -853,12 +868,12 @@ async def start_bot():
         # Статус/роль
         p = next((x for x in peers_with_status() if x.get("name") == name), None)
         if not p or p.get("status") != "alive":
-            await q.message.edit_text(f"Сервер *{name}*: Offline", parse_mode="Markdown",
+            await safe_edit(q.message, f"Сервер *{name}*: Offline", parse_mode="Markdown",
                                       reply_markup=build_server_menu(name))
         else:
             is_host = (current_leader().get("node_id") == p.get("node_id"))
             tag = " — *Хост*" if is_host else ""
-            await q.message.edit_text(f"Сервер *{name}*{tag}", parse_mode="Markdown",
+            await safe_edit(q.message, f"Сервер *{name}*{tag}", parse_mode="Markdown",
                                       reply_markup=build_server_menu(name))
         await q.answer()
 
@@ -889,7 +904,7 @@ async def start_bot():
                 f"CPU: {', '.join(str(x) + '%' for x in s['cpu_per_core_pct'])}\n"
                 f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
                 f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
-        await q.message.edit_text(text, parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await safe_edit(q.message, text, parse_mode="Markdown", reply_markup=build_server_menu(target))
         await q.answer()
 
     @DP.callback_query(F.data == "action:reboot")
@@ -897,7 +912,7 @@ async def start_bot():
     async def cb_reboot_ask(q: types.CallbackQuery):
         st = UI.get(q.message.chat.id, {})
         target = st.get("selected")
-        await q.message.edit_text(f"Перезагрузить *{target}*?", parse_mode="Markdown",
+        await safe_edit(q.message, f"Перезагрузить *{target}*?", parse_mode="Markdown",
                                   reply_markup=build_reboot_confirm())
         await q.answer()
 
@@ -906,7 +921,7 @@ async def start_bot():
     async def cb_reboot_back(q: types.CallbackQuery):
         st = UI.get(q.message.chat.id, {})
         target = st.get("selected")
-        await q.message.edit_text(f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await safe_edit(q.message, f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
         await q.answer()
 
     @DP.callback_query(F.data == "action:reboot_yes")
@@ -927,7 +942,7 @@ async def start_bot():
         if not res.get("ok"):
             await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
             return
-        await q.message.edit_text(f"Отправлена команда перезагрузки *{target}*…", parse_mode="Markdown",
+        await safe_edit(q.message, f"Отправлена команда перезагрузки *{target}*…", parse_mode="Markdown",
                                   reply_markup=build_server_menu(target))
         await q.answer("Перезагрузка запрошена")
 
@@ -939,7 +954,7 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True);
             return
-        await q.message.edit_text(f"Сервер *{target}*\nВыполняю спидтест…", parse_mode="Markdown",
+        await safe_edit(q.message, f"Сервер *{target}*\nВыполняю спидтест…", parse_mode="Markdown",
                                   reply_markup=build_server_menu(target))
         addr = None
         for p in state.get("peers", []) + [self_peer]:
@@ -952,11 +967,11 @@ async def start_bot():
             return
         res = await rpc_speedtest(addr)
         if not res.get("ok"):
-            await q.message.edit_text(f"Сервер *{target}*\nОшибка спидтеста: {res.get('error')}", parse_mode="Markdown",
+            await safe_edit(q.message, f"Сервер *{target}*\nОшибка спидтеста: {res.get('error')}", parse_mode="Markdown",
                                       reply_markup=build_server_menu(target))
         else:
-            await q.message.edit_text(
-                f"Сервер *{target}*\n↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms",
+            await safe_edit(
+                q.message, f"Сервер *{target}*\n↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms",
                 parse_mode="Markdown",
                 reply_markup=build_server_menu(target)
             )
@@ -966,9 +981,12 @@ async def start_bot():
     @only_owner
     async def cb_graphs_menu(q: types.CallbackQuery):
         st = UI.get(q.message.chat.id, {})
-        target = st.get("selected") or "?"
-        await q.message.edit_text(f"Сервер *{target}* — раздел графиков", parse_mode="Markdown",
-                                  reply_markup=build_graph_menu())
+        target = st.get("selected")
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        await safe_edit(q.message, f"Сервер *{target}* — раздел графиков", parse_mode="Markdown",
+                        reply_markup=build_graph_menu())
         await q.answer()
 
     @DP.callback_query(F.data == "graph:cpu")
@@ -977,19 +995,23 @@ async def start_bot():
         st = UI.get(q.message.chat.id, {})
         target = st.get("selected")
         if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True);
+            await q.answer("Сначала выберите сервер", show_alert=True)
             return
         addr = None
         for p in state.get("peers", []) + [self_peer]:
             if p.get("name") == target:
-                addr = p.get("addr");
+                addr = p.get("addr")
                 break
-        if target == SERVER_NAME: addr = LISTEN_ADDR
+        if target == SERVER_NAME:
+            addr = LISTEN_ADDR
+
         res = await rpc_get_ts(addr, "cpu", hours=6)
         if not res.get("ok"):
-            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True)
             return
-        img = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
+
+        img_bytes = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
+        img = BufferedInputFile(img_bytes, filename="cpu.png")
         await q.message.answer_photo(img)
         await q.answer()
 
@@ -1031,7 +1053,8 @@ async def start_bot():
         plt.savefig(buf, format="png");
         plt.close();
         buf.seek(0)
-        await q.message.answer_photo(buf.getvalue())
+        img = BufferedInputFile(buf.getvalue(), filename="graph.png")
+        await q.message.answer_photo(img)
         await q.answer()
 
     @DP.callback_query(F.data == "back:nodes")
@@ -1040,7 +1063,7 @@ async def start_bot():
         st = UI.get(q.message.chat.id, {"page": 0, "selected": None})
         st["selected"] = None
         UI[q.message.chat.id] = st
-        await q.message.edit_text("Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
+        await safe_edit(q.message, "Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
         await q.answer()
 
     @DP.callback_query(F.data == "back:server")
@@ -1048,7 +1071,7 @@ async def start_bot():
     async def cb_back_server(q: types.CallbackQuery):
         st = UI.get(q.message.chat.id, {})
         target = st.get("selected")
-        await q.message.edit_text(f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await safe_edit(q.message, f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
         await q.answer()
 
     @DP.message(Command("invite"))
@@ -1101,6 +1124,8 @@ async def start_bot():
                     break
 
                 try:
+                    print(
+                        f"[bot] loop: am_leader={am_leader}, have_lease={have_lease}, my_gen={my_gen}, global_gen={BOT_RUN_GEN}")
                     await DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types())
                     break  # если вернулось без исключения — выходим
                 except Exception as e:
@@ -1148,6 +1173,7 @@ async def stop_bot():
     try:
         from aiogram import Bot as _Bot
         _tmp = _Bot(BOT_TOKEN)
+        print("[bot] stop: set webhook cutover OK")
         await _tmp.set_webhook(
             url="https://example.invalid/constella-stop",
             allowed_updates=[],
@@ -1160,6 +1186,7 @@ async def stop_bot():
     # 2) Просим polling завершиться корректно и ждём таск
     try:
         if DP is not None:
+            print("[bot] stop: DP.stop_polling() sent")
             DP.stop_polling()
     except Exception:
         pass
@@ -1174,6 +1201,7 @@ async def stop_bot():
     try:
         from aiogram import Bot as _Bot2
         _tmp2 = _Bot2(BOT_TOKEN)
+        print("[bot] stop: delete_webhook OK")
         await _tmp2.delete_webhook(drop_pending_updates=True)
         await _tmp2.session.close()
     except Exception:
