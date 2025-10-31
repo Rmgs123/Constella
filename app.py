@@ -80,6 +80,12 @@ else:
 peers: Dict[str, Dict[str, Any]] = {}
 self_peer = {"name": SERVER_NAME, "addr": PUBLIC_ADDR, "node_id": NODE_ID, "status": "alive", "last_seen": now_s()}
 
+# Telegram globals
+BOT: Optional["Bot"] = None
+DP: Optional["Dispatcher"] = None
+BOT_TASK: Optional[asyncio.Task] = None
+BOT_RUN_GEN = 0   # глобальный счётчик поколений
+
 # ----------------------------
 # Подпись RPC (HMAC)
 # ----------------------------
@@ -577,17 +583,14 @@ async def do_join_if_needed():
 # Telegram бот (aiogram v3)
 # ----------------------------
 
-from typing import Optional
-BOT: Optional["Bot"] = None
-DP: Optional["Dispatcher"] = None
-BOT_TASK: Optional[asyncio.Task] = None
-
 def normalized_owner() -> str:
     u = state.get("owner_username","").strip()
     return u[1:] if u.startswith("@") else u
 
 async def start_bot():
-    global BOT, DP, BOT_TASK
+    global BOT, DP, BOT_TASK, BOT_RUN_GEN
+
+    # если уже запущен — не плодим дубликаты
     if BOT_TASK and not BOT_TASK.done():
         print("[bot] already running; skip")
         return
@@ -597,6 +600,10 @@ async def start_bot():
 
     BOT = Bot(BOT_TOKEN)
     DP = Dispatcher()
+
+    # зафиксируем «поколение» запуска для этого инстанса
+    BOT_RUN_GEN += 1
+    my_gen = BOT_RUN_GEN
 
     owner = normalized_owner()
     def only_owner(handler):
@@ -694,7 +701,7 @@ async def start_bot():
 
     async def _run():
         try:
-            # Забьём любые параллельные getUpdates этим токеном
+            # Жёстко обрубаем любые висящие getUpdates этим токеном
             try:
                 await BOT.set_webhook(
                     url="https://example.invalid/constella-cutover",
@@ -704,21 +711,65 @@ async def start_bot():
             except Exception:
                 pass
             await asyncio.sleep(1.0)
-            # Возвращаемся к long-poll: чистый старт
             await BOT.delete_webhook(drop_pending_updates=True)
-            await DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types())
+
+            while True:
+                # Выходим, если поколение сменилось
+                if my_gen != BOT_RUN_GEN:
+                    break
+
+                # Доп. страховка: мы всё ещё лидер и владелец lease?
+                L = current_leader()
+                am_leader = (L.get("node_id") == NODE_ID)
+                owner, until = get_bot_lease()
+                have_lease = (owner == NODE_ID and until > now_s())
+                if not (am_leader and have_lease):
+                    break
+
+                try:
+                    await DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types())
+                    break  # если вернулось без исключения — выходим
+                except Exception as e:
+                    from aiogram.exceptions import TelegramConflictError
+                    if isinstance(e, TelegramConflictError):
+                        print(f"[bot] polling conflict: {e!s}")
+                        await asyncio.sleep(1.5)
+                        continue
+                    else:
+                        print(f"[bot] polling error: {e!r}")
+                        await asyncio.sleep(1.5)
+                        continue
         except asyncio.CancelledError:
             pass
         finally:
+            # финальная зачистка — рубим webhook и закрываем сессии
+            try:
+                await BOT.set_webhook(
+                    url="https://example.invalid/constella-cutover",
+                    allowed_updates=[],
+                    drop_pending_updates=True
+                )
+                await BOT.delete_webhook(drop_pending_updates=True)
+            except Exception:
+                pass
+            try:
+                await DP.stop_polling()
+            except Exception:
+                pass
             try:
                 await BOT.session.close()
             except Exception:
                 pass
 
+    # ВАЖНО: создаём фоновой таск
     BOT_TASK = asyncio.create_task(_run())
 
 async def stop_bot():
-    global BOT, DP, BOT_TASK
+    global BOT, DP, BOT_TASK, BOT_RUN_GEN
+
+    # 0) мгновенно «инвалидируем» активный цикл
+    BOT_RUN_GEN += 1
+
     # 1) Глобально «переключаем» токен в webhook, чтобы обрубить любые getUpdates
     try:
         from aiogram import Bot as _Bot
