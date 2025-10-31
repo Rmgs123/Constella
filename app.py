@@ -352,6 +352,8 @@ async def join(req):
     # Рассылаем остальным пинг, чтобы они увидели нового участника
     asyncio.create_task(propagate_new_peer(new_peer))
 
+    set_state("join_url", "")
+
     return web.json_response({
         "ok": True,
         "network_id": state.get("network_id"),

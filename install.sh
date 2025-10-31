@@ -13,7 +13,8 @@ Usage:
   ./install.sh join  --server-name NAME --join "join://HOST:PORT?net=...&token=...&ttl=..."
 
 Notes:
-  - После init/join отредактируйте при необходимости .env и запустите:
+  - После init/join вы можете при необходимости поправить .env вручную
+  - Запуск:
       docker compose up -d --build
 EOF
 }
@@ -69,6 +70,7 @@ EOF
   "peers": []
 }
 EOF
+
     green "Init ready. Run: docker compose up -d --build"
     ;;
 
@@ -91,13 +93,19 @@ EOF
     fi
     PUBLIC_ADDR="${PUB_IP}:4747"
 
+    # Запросим @owner и (необязательно) токен бота
+    read -rp "Owner (@username): " OWNER_USERNAME
+    OWNER_USERNAME=${OWNER_USERNAME:-}
+    read -rp "Bot token (optional, Enter to skip): " BOT_TOKEN
+    BOT_TOKEN=${BOT_TOKEN:-}
+
     cat > .env <<EOF
 SERVER_NAME=${SERVER_NAME}
 LISTEN_ADDR=0.0.0.0:4747
 PUBLIC_ADDR=${PUBLIC_ADDR}
 
-OWNER_USERNAME=
-BOT_TOKEN=
+OWNER_USERNAME=${OWNER_USERNAME}
+BOT_TOKEN=${BOT_TOKEN}
 
 NETWORK_ID=
 NETWORK_SECRET=
@@ -107,6 +115,18 @@ JOIN_URL=${JOIN_URL}
 EOF
 
     mkdir -p state
+    # пустой минимальный стейт — do_join_if_needed() заполнит после успешного /join
+    if [[ ! -f state/network_state.json ]]; then
+      cat > state/network_state.json <<EOF
+{
+  "network_id": "",
+  "owner_username": "${OWNER_USERNAME}",
+  "network_secret": "",
+  "peers": []
+}
+EOF
+    fi
+
     green "Join ready. Run: docker compose up -d --build"
     ;;
 
