@@ -4,6 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libfreetype6 libpng16-16 fonts-dejavu-core \
     procps ca-certificates tzdata && \
     rm -rf /var/lib/apt/lists/*
 

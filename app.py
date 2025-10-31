@@ -4,6 +4,12 @@ from typing import Dict, Any, List, Optional, Tuple
 from aiohttp import web, ClientSession, ClientTimeout
 import psutil
 
+from collections import deque
+import io
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # Зарефакторить код
 
 # ----------------------------
@@ -22,6 +28,17 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")  # @username (устанавливается при init)
 JOIN_URL = os.environ.get("JOIN_URL", "")  # используется при первом старте join
 SEED_PEERS = [p.strip() for p in os.environ.get("SEED_PEERS", "").split(",") if p.strip()]
+
+SAMPLE_EVERY_SEC = int(os.environ.get("SAMPLE_EVERY_SEC", "300"))  # 5 мин
+METRICS_WINDOW_H = int(os.environ.get("METRICS_WINDOW_H", "6"))    # последние 6 часов
+ENABLE_BG_SPEEDTEST = os.environ.get("ENABLE_BG_SPEEDTEST", "1") == "1"
+
+# Тайм-серии (только в RAM на узле)
+_MAX_POINTS = (METRICS_WINDOW_H * 3600) // SAMPLE_EVERY_SEC + 4
+CPU_SAMPLES = deque(maxlen=_MAX_POINTS)           # [(ts, cpu_pct)]
+NET_DOWN_SAMPLES = deque(maxlen=_MAX_POINTS)      # [(ts, mbps)]
+NET_UP_SAMPLES = deque(maxlen=_MAX_POINTS)        # [(ts, mbps)]
+SPEEDTEST_LOCK = asyncio.Lock()
 
 # Секрет сети (для HMAC подписи). В init задаётся; при join — приходит от seed.
 NETWORK_ID = os.environ.get("NETWORK_ID", "")
@@ -52,6 +69,71 @@ def save_json(path: str, data: Any):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+async def run_local_speedtest() -> Dict[str, Any]:
+    try:
+        import speedtest
+    except Exception:
+        return {"ok": False, "error": "speedtest-cli not installed (pip install speedtest-cli)"}
+    try:
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        down = st.download() / 1e6  # Mbps
+        up = st.upload() / 1e6      # Mbps
+        ping = st.results.ping
+        return {"ok": True, "down_mbps": round(down, 2), "up_mbps": round(up, 2), "ping_ms": round(ping, 1)}
+    except Exception as e:
+        return {"ok": False, "error": f"{e}"}
+
+def _filter_last_hours(samples: deque, hours: int) -> list[tuple[int, float]]:
+    cutoff = now_s() - hours * 3600
+    return [(ts, v) for ts, v in samples if ts >= cutoff]
+
+def render_timeseries_png(title: str, series: list[tuple[int, float]], ylabel: str) -> bytes:
+    if not series:
+        series = [(now_s(), 0.0)]
+    xs = [ts for ts, _ in series]
+    ys = [v for _, v in series]
+    # к секундам добавим человеческие подписи
+    plt.figure(figsize=(10, 4), dpi=160)
+    plt.plot(xs, ys, linewidth=2)
+    plt.title(title)
+    plt.ylabel(ylabel)
+    plt.xlabel("time")
+    plt.grid(True, alpha=0.3)
+    # автолэйаут и сохранение в буфер
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close()
+    buf.seek(0)
+    return buf.read()
+
+async def telemetry_loop():
+    # Первичный быстрый замер CPU, потом каждые SAMPLE_EVERY_SEC
+    CPU_SAMPLES.append((now_s(), psutil.cpu_percent(interval=0.2)))
+    if ENABLE_BG_SPEEDTEST:
+        # не блокируем первый цикл, просто отметим нули — живые значения появятся при первом /network или плановом прогоне
+        NET_DOWN_SAMPLES.append((now_s(), 0.0))
+        NET_UP_SAMPLES.append((now_s(), 0.0))
+
+    while True:
+        ts = now_s()
+        # CPU
+        CPU_SAMPLES.append((ts, psutil.cpu_percent(interval=0.2)))
+
+        # Network speed (раз в SAMPLE_EVERY_SEC, но защищаемся от параллельного прогона)
+        if ENABLE_BG_SPEEDTEST and not SPEEDTEST_LOCK.locked():
+            async with SPEEDTEST_LOCK:
+                res = await run_local_speedtest()
+                if res.get("ok"):
+                    NET_DOWN_SAMPLES.append((now_s(), float(res["down_mbps"])))
+                    NET_UP_SAMPLES.append((now_s(), float(res["up_mbps"])))
+                else:
+                    # фиксируем 0 чтобы график не рвался
+                    NET_DOWN_SAMPLES.append((now_s(), 0.0))
+                    NET_UP_SAMPLES.append((now_s(), 0.0))
+        await asyncio.sleep(SAMPLE_EVERY_SEC)
 
 # Сетевое общее состояние (кэш на узле)
 state = load_json(STATE_FILE, {
@@ -380,6 +462,32 @@ async def rpc(req):
             return web.json_response({"ok": True})
         return web.json_response({"ok": True})  # идемпотентно
 
+    elif method == "GetTS":
+        kind = (params.get("kind") or "").lower()
+        hours = int(params.get("hours", 6))
+        if kind == "cpu":
+            data = _filter_last_hours(CPU_SAMPLES, hours)
+            return web.json_response({"ok": True, "kind": "cpu", "series": data})
+        elif kind == "net":
+            d = _filter_last_hours(NET_DOWN_SAMPLES, hours)
+            u = _filter_last_hours(NET_UP_SAMPLES, hours)
+            return web.json_response({"ok": True, "kind": "net", "down": d, "up": u})
+        else:
+            return web.json_response({"ok": False, "error": "unknown timeseries kind"}, status=400)
+
+    elif method == "RunSpeedtest":
+        # принудительный спидтест «сейчас»
+        if SPEEDTEST_LOCK.locked():
+            return web.json_response({"ok": False, "error": "another speedtest running"})
+        async with SPEEDTEST_LOCK:
+            res = await run_local_speedtest()
+        if res.get("ok"):
+            # добавим точку в локальную серию
+            ts = now_s()
+            NET_DOWN_SAMPLES.append((ts, float(res["down_mbps"])))
+            NET_UP_SAMPLES.append((ts, float(res["up_mbps"])))
+        return web.json_response(res)
+
     else:
         return web.json_response({"ok": False, "error": "unknown method"}, status=400)
 
@@ -400,6 +508,12 @@ async def lease_acquire_from(coord_addr: str, owner: str, ttl: int) -> Dict[str,
 
 async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
     return await call_rpc(coord_addr, "Lease.Release", {"owner": owner})
+
+async def rpc_get_ts(addr: str, kind: str, hours: int = 6) -> Dict[str, Any]:
+    return await call_rpc(addr, "GetTS", {"kind": kind, "hours": hours})
+
+async def rpc_speedtest(addr: str) -> Dict[str, Any]:
+    return await call_rpc(addr, "RunSpeedtest", {})
 
 async def propagate_new_peer(new_peer):
     """Рассылаем информацию о новом пире всем живым узлам"""
@@ -595,8 +709,14 @@ async def start_bot():
         print("[bot] already running; skip")
         return
 
-    from aiogram import Bot, Dispatcher, types
+    from aiogram import Bot, Dispatcher, types, F
     from aiogram.filters import Command
+    from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+    # --- простое состояние UI на 1 владельца ---
+    UI = {}  # chat_id -> {"msg_id": int, "page": int, "selected": Optional[str]}
+
+    PAGE_SIZE = 6
 
     BOT = Bot(BOT_TOKEN)
     DP = Dispatcher()
@@ -614,68 +734,320 @@ async def start_bot():
             return await handler(m)
         return wrapper
 
+    def peers_with_status():
+        # берём state.peers + self_peer, обновл. статус уже делает heartbeat_loop
+        d = {p.get("node_id", ""): p for p in state.get("peers", [])}
+        d[NODE_ID] = self_peer
+        return list(d.values())
+
+    def build_nodes_page(page: int) -> types.InlineKeyboardMarkup:
+        peers = sorted(peers_with_status(), key=lambda p: p.get("name", ""))
+        total = len(peers)
+        start = page * PAGE_SIZE
+        chunk = peers[start:start + PAGE_SIZE]
+        kb = InlineKeyboardBuilder()
+        for p in chunk:
+            name = p.get("name")
+            status = p.get("status", "unknown")
+            tag = " 🟢" if status == "alive" else " 🔴"
+            kb.button(text=f"{name}{tag}", callback_data=f"server:{name}")
+        kb.adjust(2)  # 2 столбца
+        # пагинация
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        if pages > 1:
+            nav = InlineKeyboardBuilder()
+            prev_p = (page - 1) % pages
+            next_p = (page + 1) % pages
+            nav.button(text="⟨", callback_data=f"page:{prev_p}")
+            nav.button(text=f"{page + 1}/{pages}", callback_data="noop")
+            nav.button(text="⟩", callback_data=f"page:{next_p}")
+            kb.row(*nav.buttons)
+        return kb.as_markup()
+
+    def build_server_menu(name: str) -> types.InlineKeyboardMarkup:
+        # найдём пира
+        p = next((x for x in peers_with_status() if x.get("name") == name), None)
+        alive = (p and p.get("status") == "alive")
+        is_host = (current_leader().get("node_id") == (p or {}).get("node_id"))
+        kb = InlineKeyboardBuilder()
+        if alive:
+            kb.button(text="📊 Stats", callback_data="action:stats")
+            kb.button(text="🌐 Network", callback_data="action:net")
+            kb.button(text="📈 Graph", callback_data="action:graphs")
+            kb.button(text="🔄 Reboot", callback_data="action:reboot")
+            kb.adjust(2, 2)
+        else:
+            kb.button(text="Сервер оффлайн", callback_data="noop")
+            kb.adjust(1)
+        kb.button(text="← Назад к списку", callback_data="back:nodes")
+        return kb.as_markup()
+
+    def build_reboot_confirm() -> types.InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Да, перезагрузить", callback_data="action:reboot_yes")
+        kb.button(text="↩️ Отмена", callback_data="action:reboot_back")
+        kb.adjust(2)
+        return kb.as_markup()
+
+    def build_graph_menu() -> types.InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="📈 CPU (6h)", callback_data="graph:cpu")
+        kb.button(text="📈 Network (6h)", callback_data="graph:net")
+        kb.button(text="← Назад", callback_data="back:server")
+        kb.adjust(2, 1)
+        return kb.as_markup()
+
+    async def ensure_ui_message(m: types.Message) -> tuple[int, dict]:
+        st = UI.get(m.chat.id, {"msg_id": 0, "page": 0, "selected": None})
+        UI[m.chat.id] = st
+        if st["msg_id"]:
+            return st["msg_id"], st
+        sent = await m.answer("Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
+        st["msg_id"] = sent.message_id
+        return st["msg_id"], st
+
+    async def edit_ui(bot: "Bot", chat_id: int, st: dict, text: str, kb: types.InlineKeyboardMarkup):
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=st["msg_id"], text=text, reply_markup=kb
+            )
+        except Exception:
+            # если сообщение потеряно (удалено), создадим заново
+            sent = await bot.send_message(chat_id, text, reply_markup=kb)
+            st["msg_id"] = sent.message_id
+
     @DP.message(Command("start"))
     @only_owner
-    async def cmd_start(m: types.Message):
-        await m.answer(f"{APP_NAME} ready. Use /nodes, /stats <name>, /reboot <name>, /invite <ttl>")
+    async def h_start(m: types.Message):
+        msg_id, st = await ensure_ui_message(m)
+        st["selected"] = None
+        await edit_ui(bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
     @DP.message(Command("nodes"))
     @only_owner
-    async def cmd_nodes(m: types.Message):
-        L = current_leader().get("node_id")
-        by_id = {p.get("node_id",""): p for p in peers_with_status()}
-        lines = []
-        for nid, p in sorted(by_id.items(), key=lambda kv: kv[1].get("name","")):
-            name = p.get("name", nid)
-            tag = " — Хост" if nid == L else ""
-            if p.get("status") != "alive":
-                tag += " (offline)"
-            lines.append(f"• {name}{tag}")
-        await m.answer("\n".join(lines) if lines else "No nodes")
+    async def h_nodes(m: types.Message):
+        msg_id, st = await ensure_ui_message(m)
+        st["selected"] = None
+        await edit_ui(bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
-    @DP.message(Command("stats"))
+    # --- обработка всех кнопок ---
+    @DP.callback_query(F.data.startswith("page:"))
     @only_owner
-    async def cmd_stats(m: types.Message):
-        parts = m.text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            return await m.reply("Usage: /stats <server_name>")
-        target = parts[1].strip()
+    async def cb_page(q: types.CallbackQuery):
+        page = int(q.data.split(":")[1])
+        st = UI.get(q.message.chat.id, {"msg_id": q.message.message_id, "page": 0, "selected": None})
+        st["page"] = page
+        UI[q.message.chat.id] = st
+        await q.message.edit_text("Выберите сервер:", reply_markup=build_nodes_page(page))
+        await q.answer()
+
+    @DP.callback_query(F.data.startswith("server:"))
+    @only_owner
+    async def cb_server(q: types.CallbackQuery):
+        name = q.data.split(":")[1]
+        st = UI.get(q.message.chat.id, {"msg_id": q.message.message_id, "page": 0, "selected": None})
+        st["selected"] = name
+        UI[q.message.chat.id] = st
+        # Статус/роль
+        p = next((x for x in peers_with_status() if x.get("name") == name), None)
+        if not p or p.get("status") != "alive":
+            await q.message.edit_text(f"Сервер *{name}*: Offline", parse_mode="Markdown",
+                                      reply_markup=build_server_menu(name))
+        else:
+            is_host = (current_leader().get("node_id") == p.get("node_id"))
+            tag = " — *Хост*" if is_host else ""
+            await q.message.edit_text(f"Сервер *{name}*{tag}", parse_mode="Markdown",
+                                      reply_markup=build_server_menu(name))
+        await q.answer()
+
+    @DP.callback_query(F.data == "action:stats")
+    @only_owner
+    async def cb_stats(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True);
+            return
         addr = None
         for p in state.get("peers", []) + [self_peer]:
-            if p.get("name")==target:
-                addr = p.get("addr"); break
-        if target == SERVER_NAME: addr = f"{LISTEN_ADDR}"
+            if p.get("name") == target:
+                addr = p.get("addr");
+                break
+        if target == SERVER_NAME: addr = LISTEN_ADDR
         if not addr:
-            return await m.reply("Unknown node")
+            await q.answer("Сервер не найден", show_alert=True);
+            return
         res = await call_rpc(addr, "GetStats", {"target": target})
         if not res.get("ok"):
-            return await m.reply(f"Error: {res.get('error')}")
+            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            return
         s = res["stats"]
-        msg = (f"*{s['server_name']}*\n"
-               f"Uptime: {s['uptime_s']}s\n"
-               f"CPU: {', '.join(str(x)+'%' for x in s['cpu_per_core_pct'])}\n"
-               f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
-               f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
-        await m.reply(msg, parse_mode="Markdown")
+        text = (f"*{s['server_name']}*\n"
+                f"Uptime: {s['uptime_s']}s\n"
+                f"CPU: {', '.join(str(x) + '%' for x in s['cpu_per_core_pct'])}\n"
+                f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
+                f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
+        await q.message.edit_text(text, parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await q.answer()
 
-    @DP.message(Command("reboot"))
+    @DP.callback_query(F.data == "action:reboot")
     @only_owner
-    async def cmd_reboot(m: types.Message):
-        parts = m.text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            return await m.reply("Usage: /reboot <server_name>")
-        target = parts[1].strip()
+    async def cb_reboot_ask(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        await q.message.edit_text(f"Перезагрузить *{target}*?", parse_mode="Markdown",
+                                  reply_markup=build_reboot_confirm())
+        await q.answer()
+
+    @DP.callback_query(F.data == "action:reboot_back")
+    @only_owner
+    async def cb_reboot_back(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        await q.message.edit_text(f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await q.answer()
+
+    @DP.callback_query(F.data == "action:reboot_yes")
+    @only_owner
+    async def cb_reboot_yes(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
         addr = None
         for p in state.get("peers", []) + [self_peer]:
-            if p.get("name")==target:
-                addr = p.get("addr"); break
-        if target == SERVER_NAME: addr = f"{LISTEN_ADDR}"
+            if p.get("name") == target:
+                addr = p.get("addr");
+                break
+        if target == SERVER_NAME: addr = LISTEN_ADDR
         if not addr:
-            return await m.reply("Unknown node")
+            await q.answer("Сервер не найден", show_alert=True);
+            return
         res = await call_rpc(addr, "Reboot", {"target": target})
         if not res.get("ok"):
-            return await m.reply(f"Error: {res.get('error')}")
-        await m.reply(f"Rebooting {target}…")
+            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            return
+        await q.message.edit_text(f"Отправлена команда перезагрузки *{target}*…", parse_mode="Markdown",
+                                  reply_markup=build_server_menu(target))
+        await q.answer("Перезагрузка запрошена")
+
+    @DP.callback_query(F.data == "action:net")
+    @only_owner
+    async def cb_net(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True);
+            return
+        await q.message.edit_text(f"Сервер *{target}*\nВыполняю спидтест…", parse_mode="Markdown",
+                                  reply_markup=build_server_menu(target))
+        addr = None
+        for p in state.get("peers", []) + [self_peer]:
+            if p.get("name") == target:
+                addr = p.get("addr");
+                break
+        if target == SERVER_NAME: addr = LISTEN_ADDR
+        if not addr:
+            await q.answer("Сервер не найден", show_alert=True);
+            return
+        res = await rpc_speedtest(addr)
+        if not res.get("ok"):
+            await q.message.edit_text(f"Сервер *{target}*\nОшибка спидтеста: {res.get('error')}", parse_mode="Markdown",
+                                      reply_markup=build_server_menu(target))
+        else:
+            await q.message.edit_text(
+                f"Сервер *{target}*\n↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms",
+                parse_mode="Markdown",
+                reply_markup=build_server_menu(target)
+            )
+        await q.answer()
+
+    @DP.callback_query(F.data == "action:graphs")
+    @only_owner
+    async def cb_graphs_menu(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected") or "?"
+        await q.message.edit_text(f"Сервер *{target}* — раздел графиков", parse_mode="Markdown",
+                                  reply_markup=build_graph_menu())
+        await q.answer()
+
+    @DP.callback_query(F.data == "graph:cpu")
+    @only_owner
+    async def cb_graph_cpu(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True);
+            return
+        addr = None
+        for p in state.get("peers", []) + [self_peer]:
+            if p.get("name") == target:
+                addr = p.get("addr");
+                break
+        if target == SERVER_NAME: addr = LISTEN_ADDR
+        res = await rpc_get_ts(addr, "cpu", hours=6)
+        if not res.get("ok"):
+            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            return
+        img = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
+        await bot.send_photo(chat_id=q.message.chat.id, photo=img)
+        await q.answer()
+
+    @DP.callback_query(F.data == "graph:net")
+    @only_owner
+    async def cb_graph_net(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True);
+            return
+        addr = None
+        for p in state.get("peers", []) + [self_peer]:
+            if p.get("name") == target:
+                addr = p.get("addr");
+                break
+        if target == SERVER_NAME: addr = LISTEN_ADDR
+        res = await rpc_get_ts(addr, "net", hours=6)
+        if not res.get("ok"):
+            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            return
+        # рисуем две линии — down/up
+        down = res.get("down", [])
+        up = res.get("up", [])
+        # объединённый график
+        # сделаем две оси на одном полотне ради читаемости
+        plt.figure(figsize=(10, 4), dpi=160)
+        if down:
+            plt.plot([x for x, _ in down], [y for _, y in down], linewidth=2, label="↓ Mbit/s")
+        if up:
+            plt.plot([x for x, _ in up], [y for _, y in up], linewidth=2, label="↑ Mbit/s")
+        plt.title(f"Network — {target} (6h)")
+        plt.ylabel("Mbit/s")
+        plt.xlabel("time")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png");
+        plt.close();
+        buf.seek(0)
+        await bot.send_photo(chat_id=q.message.chat.id, photo=buf.getvalue())
+        await q.answer()
+
+    @DP.callback_query(F.data == "back:nodes")
+    @only_owner
+    async def cb_back_nodes(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {"page": 0, "selected": None})
+        st["selected"] = None
+        UI[q.message.chat.id] = st
+        await q.message.edit_text("Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
+        await q.answer()
+
+    @DP.callback_query(F.data == "back:server")
+    @only_owner
+    async def cb_back_server(q: types.CallbackQuery):
+        st = UI.get(q.message.chat.id, {})
+        target = st.get("selected")
+        await q.message.edit_text(f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
+        await q.answer()
 
     @DP.message(Command("invite"))
     @only_owner
@@ -896,10 +1268,12 @@ async def on_startup(app):
     # Запускаем фоновые циклы
     app['hb'] = asyncio.create_task(heartbeat_loop())
     app['lw'] = asyncio.create_task(leader_watcher())
+    app['telemetry'] = asyncio.create_task(telemetry_loop())
 
 async def on_cleanup(app):
     app['hb'].cancel()
     app['lw'].cancel()
+    app['telemetry'].cancel()
     await stop_bot()
     if http_client:
         await http_client.close()
