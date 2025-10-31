@@ -823,14 +823,14 @@ async def start_bot():
     async def h_start(m: types.Message):
         msg_id, st = await ensure_ui_message(m)
         st["selected"] = None
-        await edit_ui(bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
+        await edit_ui(m.bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
     @DP.message(Command("nodes"))
     @only_owner
     async def h_nodes(m: types.Message):
         msg_id, st = await ensure_ui_message(m)
         st["selected"] = None
-        await edit_ui(bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
+        await edit_ui(m.bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
     # --- обработка всех кнопок ---
     @DP.callback_query(F.data.startswith("page:"))
@@ -990,7 +990,7 @@ async def start_bot():
             await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
             return
         img = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
-        await bot.send_photo(chat_id=q.message.chat.id, photo=img)
+        await q.message.answer_photo(img)
         await q.answer()
 
     @DP.callback_query(F.data == "graph:net")
@@ -1031,7 +1031,7 @@ async def start_bot():
         plt.savefig(buf, format="png");
         plt.close();
         buf.seek(0)
-        await bot.send_photo(chat_id=q.message.chat.id, photo=buf.getvalue())
+        await q.message.answer_photo(buf.getvalue())
         await q.answer()
 
     @DP.callback_query(F.data == "back:nodes")
