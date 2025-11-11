@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 COPY requirements.txt .
-# более устойчивый инсталл при сетевых глюках
+# более устойчивый инсталл при сетевых багах
 RUN pip install --retries 5 --timeout 120 -r requirements.txt
 
 COPY app.py .
