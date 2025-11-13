@@ -173,6 +173,9 @@ BOT: Optional["Bot"] = None
 DP: Optional["Dispatcher"] = None
 BOT_TASK: Optional[asyncio.Task] = None
 BOT_RUN_GEN = 0   # глобальный счётчик поколений
+BOT_LOCK = asyncio.Lock()
+BOT_RUNNING_OWNER: Optional[str] = None
+BOT_LAST_BROADCAST_UNTIL = 0
 
 # ----------------------------
 # Подпись RPC (HMAC)
@@ -484,6 +487,33 @@ async def rpc(req):
             return web.json_response({"ok": True})
         return web.json_response({"ok": True})  # идемпотентно
 
+    elif method == "Bot.Takeover":
+        new_owner = params.get("owner", "")
+        until = int(params.get("until", 0) or 0)
+        nowt = now_s()
+        display = new_owner[:8] if new_owner else "<none>"
+        print(f"[rpc] takeover request: owner={display} until={until}")
+        # если новый владелец не мы — обязательно гасим локальный бот
+        should_stop = new_owner != NODE_ID or until <= nowt
+        stopped = False
+        if should_stop and bot_task_running():
+            print(f"[rpc] takeover: stopping bot for new owner {display}")
+            await stop_bot()
+            stopped = True
+        set_bot_lease(new_owner, until)
+        if new_owner != NODE_ID:
+            # запоминаем в глобальном состоянии, что лидер сменился
+            global BOT_RUNNING_OWNER
+            BOT_RUNNING_OWNER = new_owner if new_owner else None
+        running = bot_task_running()
+        return web.json_response({
+            "ok": True,
+            "stopped": stopped,
+            "running": running,
+            "owner": new_owner,
+            "until": until
+        })
+
     elif method == "GetTS":
         kind = (params.get("kind") or "").lower()
         hours = int(params.get("hours", 6))
@@ -530,6 +560,34 @@ async def lease_acquire_from(coord_addr: str, owner: str, ttl: int) -> Dict[str,
 
 async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
     return await call_rpc(coord_addr, "Lease.Release", {"owner": owner})
+
+async def bot_takeover(addr: str, owner: str, until: int) -> Dict[str, Any]:
+    return await call_rpc(addr, "Bot.Takeover", {"owner": owner, "until": until})
+
+async def propagate_bot_lease(owner: str, until: int):
+    """Рассылаем информацию о новом владельце бота всем живым узлам."""
+    global BOT_LAST_BROADCAST_UNTIL
+    set_bot_lease(owner, until)
+    BOT_LAST_BROADCAST_UNTIL = until if owner else 0
+    peers = [p for p in get_alive_peers() if p.get("node_id") != NODE_ID and p.get("addr")]
+    if not peers:
+        return
+
+    async def notify(p):
+        addr = p.get("addr")
+        name = p.get("name") or addr
+        try:
+            res = await bot_takeover(addr, owner, until)
+            if res.get("ok"):
+                stopped = res.get("stopped")
+                running = res.get("running")
+                print(f"[lease] takeover -> {name}: stopped={stopped} running={running}")
+            else:
+                print(f"[lease] takeover rejected by {name}: {res}")
+        except Exception as e:
+            print(f"[lease] takeover notify failed for {name}: {e}")
+
+    await asyncio.gather(*(notify(p) for p in peers), return_exceptions=True)
 
 async def rpc_get_ts(addr: str, kind: str, hours: int = 6) -> Dict[str, Any]:
     return await call_rpc(addr, "GetTS", {"kind": kind, "hours": hours})
@@ -723,29 +781,36 @@ def normalized_owner() -> str:
     u = state.get("owner_username","").strip()
     return u[1:] if u.startswith("@") else u
 
+def bot_task_running() -> bool:
+    return BOT_TASK is not None and not BOT_TASK.done()
+
 async def start_bot():
-    global BOT, DP, BOT_TASK, BOT_RUN_GEN
+    global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER
 
-    # если уже запущен — не плодим дубликаты
-    if BOT_TASK and not BOT_TASK.done():
-        print("[bot] already running; skip")
-        return
+    async with BOT_LOCK:
+        # если уже запущен — не плодим дубликаты
+        if bot_task_running():
+            print("[bot] already running; skip")
+            return
 
-    from aiogram import Bot, Dispatcher, types, F
-    from aiogram.filters import Command
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
+        BOT = DP = None  # ensure reset before creation
 
-    # --- простое состояние UI на 1 владельца ---
-    UI = {}  # chat_id -> {"msg_id": int, "page": int, "selected": Optional[str]}
+        from aiogram import Bot, Dispatcher, types, F
+        from aiogram.filters import Command
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-    PAGE_SIZE = 6
+        # --- простое состояние UI на 1 владельца ---
+        UI = {}  # chat_id -> {"msg_id": int, "page": int, "selected": Optional[str]}
 
-    BOT = Bot(BOT_TOKEN)
-    DP = Dispatcher()
+        PAGE_SIZE = 6
 
-    # зафиксируем «поколение» запуска для этого инстанса
-    BOT_RUN_GEN += 1
-    my_gen = BOT_RUN_GEN
+        BOT = Bot(BOT_TOKEN)
+        DP = Dispatcher()
+
+        # зафиксируем «поколение» запуска для этого инстанса
+        BOT_RUN_GEN += 1
+        my_gen = BOT_RUN_GEN
+        BOT_RUNNING_OWNER = NODE_ID
 
     owner = normalized_owner()
     def only_owner(handler):
@@ -1100,22 +1165,27 @@ async def start_bot():
         await m.reply(f"Join link (valid {ttl_s}s):\n`{link}`", parse_mode="Markdown")
 
     async def _run():
+        global BOT_RUNNING_OWNER
         try:
             # Жёстко обрубаем любые висящие getUpdates этим токеном
             try:
                 await BOT.set_webhook(
                     url="https://example.invalid/constella-cutover",
                     allowed_updates=[],
-                    drop_pending_updates=True
+                    drop_pending_updates=True,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[bot] pre-start webhook set failed: {e}")
             await asyncio.sleep(1.0)
-            await BOT.delete_webhook(drop_pending_updates=True)
+            try:
+                await BOT.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                print(f"[bot] pre-start delete_webhook failed: {e}")
 
             while True:
                 # Выходим, если поколение сменилось
                 if my_gen != BOT_RUN_GEN:
+                    print("[bot] generation changed, exiting polling loop")
                     break
 
                 # Доп. страховка: мы всё ещё лидер и владелец lease?
@@ -1124,17 +1194,38 @@ async def start_bot():
                 owner, until = get_bot_lease()
                 have_lease = (owner == NODE_ID and until > now_s())
                 if not (am_leader and have_lease):
+                    print(f"[bot] exiting: am_leader={am_leader}, have_lease={have_lease}, owner={owner[:8] if owner else ''}")
                     break
 
                 try:
                     print(
-                        f"[bot] loop: am_leader={am_leader}, have_lease={have_lease}, my_gen={my_gen}, global_gen={BOT_RUN_GEN}")
+                        f"[bot] loop: am_leader={am_leader}, have_lease={have_lease}, my_gen={my_gen}, global_gen={BOT_RUN_GEN}"
+                    )
                     await DP.start_polling(BOT, allowed_updates=DP.resolve_used_update_types())
+                    print("[bot] polling finished gracefully")
                     break  # если вернулось без исключения — выходим
                 except Exception as e:
                     from aiogram.exceptions import TelegramConflictError
                     if isinstance(e, TelegramConflictError):
                         print(f"[bot] polling conflict: {e!s}")
+                        # Проверим, не сменился ли владелец lease
+                        lease_owner, lease_until = owner, until
+                        try:
+                            coord = lease_coordinator_peer()
+                            if coord and coord.get("addr"):
+                                info = await lease_get_from(coord["addr"])
+                                if info.get("ok"):
+                                    lease_owner = info.get("owner", lease_owner)
+                                    lease_until = int(info.get("until", lease_until) or 0)
+                        except Exception as le:
+                            print(f"[bot] lease check failed after conflict: {le}")
+                        else:
+                            if lease_owner != NODE_ID:
+                                print(f"[bot] conflict: lease now owned by {lease_owner[:8] if lease_owner else '<none>'}, stopping")
+                                break
+                            if lease_until <= now_s():
+                                print("[bot] conflict: lease expired, stopping")
+                                break
                         await asyncio.sleep(1.5)
                         continue
                     else:
@@ -1142,131 +1233,192 @@ async def start_bot():
                         await asyncio.sleep(1.5)
                         continue
         except asyncio.CancelledError:
-            pass
+            print("[bot] polling task cancelled")
         finally:
             # финальная зачистка — рубим webhook и закрываем сессии
             try:
                 await BOT.set_webhook(
                     url="https://example.invalid/constella-cutover",
                     allowed_updates=[],
-                    drop_pending_updates=True
+                    drop_pending_updates=True,
                 )
                 await BOT.delete_webhook(drop_pending_updates=True)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[bot] cleanup webhook error: {e}")
             try:
                 await DP.stop_polling()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[bot] cleanup stop_polling error: {e}")
             try:
                 await BOT.session.close()
-            except Exception:
-                pass
-
+            except Exception as e:
+                print(f"[bot] cleanup session close error: {e}")
+            BOT_RUNNING_OWNER = None
     # ВАЖНО: создаём фоновой таск
     BOT_TASK = asyncio.create_task(_run())
 
 async def stop_bot():
-    global BOT, DP, BOT_TASK, BOT_RUN_GEN
+    global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER, BOT_LAST_BROADCAST_UNTIL
 
-    # 0) мгновенно «инвалидируем» активный цикл
-    BOT_RUN_GEN += 1
+    async with BOT_LOCK:
+        if not bot_task_running() and BOT is None and DP is None:
+            BOT_RUNNING_OWNER = None
+            return
 
-    # 1) Глобально «переключаем» токен в webhook, чтобы обрубить любые getUpdates
-    try:
-        from aiogram import Bot as _Bot
-        _tmp = _Bot(BOT_TOKEN)
-        print("[bot] stop: set webhook cutover OK")
-        await _tmp.set_webhook(
-            url="https://example.invalid/constella-stop",
-            allowed_updates=[],
-            drop_pending_updates=True
-        )
-        await _tmp.session.close()
-    except Exception:
-        pass
+        # 0) мгновенно «инвалидируем» активный цикл
+        BOT_RUN_GEN += 1
 
-    # 2) Просим polling завершиться корректно и ждём таск
-    try:
-        if DP is not None:
-            print("[bot] stop: DP.stop_polling() sent")
-            DP.stop_polling()
-    except Exception:
-        pass
-    if BOT_TASK and not BOT_TASK.done():
-        BOT_TASK.cancel()
+        # 1) Глобально «переключаем» токен в webhook, чтобы обрубить любые getUpdates
         try:
-            await BOT_TASK
-        except asyncio.CancelledError:
-            pass
+            from aiogram import Bot as _Bot
+            _tmp = _Bot(BOT_TOKEN)
+            print("[bot] stop: set webhook cutover OK")
+            await _tmp.set_webhook(
+                url="https://example.invalid/constella-stop",
+                allowed_updates=[],
+                drop_pending_updates=True
+            )
+            await _tmp.session.close()
+        except Exception as e:
+            print(f"[bot] stop: set webhook failed: {e}")
 
-    # 3) Убираем webhook — следующий лидер начнёт polling без конфликта
-    try:
-        from aiogram import Bot as _Bot2
-        _tmp2 = _Bot2(BOT_TOKEN)
-        print("[bot] stop: delete_webhook OK")
-        await _tmp2.delete_webhook(drop_pending_updates=True)
-        await _tmp2.session.close()
-    except Exception:
-        pass
+        # 2) Просим polling завершиться корректно и ждём таск
+        try:
+            if DP is not None:
+                print("[bot] stop: DP.stop_polling() sent")
+                DP.stop_polling()
+        except Exception as e:
+            print(f"[bot] stop: DP.stop_polling error: {e}")
+        task = BOT_TASK
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
-    BOT_TASK = None
-    DP = None
-    BOT = None
+        # 3) Убираем webhook — следующий лидер начнёт polling без конфликта
+        try:
+            from aiogram import Bot as _Bot2
+            _tmp2 = _Bot2(BOT_TOKEN)
+            print("[bot] stop: delete_webhook OK")
+            await _tmp2.delete_webhook(drop_pending_updates=True)
+            await _tmp2.session.close()
+        except Exception as e:
+            print(f"[bot] stop: delete_webhook failed: {e}")
+
+        BOT_TASK = None
+        DP = None
+        BOT = None
+        BOT_RUNNING_OWNER = None
+        BOT_LAST_BROADCAST_UNTIL = 0
 
 async def leader_watcher():
     was_leader = False
+    grace_deadline = 0.0
     while True:
-        L = current_leader()
+        try:
+            L = current_leader()
+        except Exception as e:
+            print(f"[leader] current_leader error: {e}")
+            await asyncio.sleep(1.0)
+            continue
+
         am = (L.get("node_id") == NODE_ID)
+        coord = lease_coordinator_peer()
+        owner, until = get_bot_lease()
+        nowt = now_s()
+        if coord and coord.get("addr"):
+            info = await lease_get_from(coord["addr"])
+            if info.get("ok"):
+                owner = info.get("owner", owner)
+                until = int(info.get("until", until) or 0)
+                set_bot_lease(owner or "", until)
+
+        running = bot_task_running()
+        if running and (not am or owner != NODE_ID or until <= nowt):
+            reasons = []
+            if not am:
+                reasons.append("lost leadership")
+            if owner != NODE_ID:
+                reasons.append(f"lease -> {owner[:8] if owner else '<none>'}")
+            if until <= nowt:
+                reasons.append("lease expired")
+            print(f"[leader] stopping local bot due to {', '.join(reasons)}")
+            await stop_bot()
+
+        if not am:
+            if was_leader:
+                print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
+                if coord and coord.get("addr") and owner == NODE_ID:
+                    await lease_release_from(coord["addr"], NODE_ID)
+                if owner == NODE_ID:
+                    set_bot_lease("", 0)
+            was_leader = False
+            await asyncio.sleep(1.0)
+            continue
 
         if am and not was_leader:
             print(f"[leader] became leader: {SERVER_NAME} ({NODE_ID[:8]}); grace={LEADER_GRACE_SEC}s")
-            # grace-пауза для гашения старого polling
-            t0 = time.time()
-            while time.time() - t0 < LEADER_GRACE_SEC:
-                if current_leader().get("node_id") != NODE_ID:
-                    break
+            grace_deadline = time.time() + LEADER_GRACE_SEC
+            was_leader = True
+
+        if time.time() < grace_deadline:
+            await asyncio.sleep(0.5)
+            continue
+
+        if not BOT_TOKEN or not state.get("owner_username"):
+            print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
+            await asyncio.sleep(1.0)
+            continue
+
+        if owner != NODE_ID or until <= nowt:
+            acquired = False
+            if coord and coord.get("addr"):
+                got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
+                if got.get("ok"):
+                    owner = got.get("owner", NODE_ID)
+                    until = int(got.get("until", nowt + BOT_LEASE_TTL))
+                    acquired = owner == NODE_ID
+                else:
+                    owner = got.get("owner", owner)
+                    until = int(got.get("until", until) or 0)
+                    set_bot_lease(owner, until)
+                    print(f"[leader] lease denied: owner={got.get('owner','')[:8]} until={got.get('until')}")
+            else:
+                owner = NODE_ID
+                until = nowt + BOT_LEASE_TTL
+                acquired = True
+            if acquired:
+                print(f"[lease] acquired until {until}")
+                await propagate_bot_lease(NODE_ID, until)
                 await asyncio.sleep(0.5)
             else:
-                if BOT_TOKEN and state.get("owner_username"):
-                    coord = lease_coordinator_peer()
-                    if coord and coord.get("addr"):
-                        info = await lease_get_from(coord["addr"])
-                        nowt = now_s()
-                        if info.get("ok") and info.get("owner") and info.get("until",0) > nowt and info.get("owner") != NODE_ID:
-                            print(f"[lease] another owner active at coordinator {coord['addr']}: {info.get('owner','')[:8]} until {info.get('until')}")
-                        else:
-                            got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
-                            if got.get("ok"):
-                                print("[leader] starting bot (lease acquired from coordinator)")
-                                await start_bot()
-                            else:
-                                print(f"[leader] lease denied by coordinator: owner={got.get('owner','')[:8]} until={got.get('until')}")
+                await asyncio.sleep(1.0)
+                continue
+        else:
+            if until - nowt < BOT_LEASE_TTL // 2:
+                refreshed = False
+                if coord and coord.get("addr"):
+                    got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
+                    if got.get("ok"):
+                        until = int(got.get("until", until))
+                        refreshed = True
                     else:
-                        print("[leader] no coordinator available; will retry later")
+                        print(f"[lease] renew denied by {got.get('owner','')[:8]} until={got.get('until')}")
                 else:
-                    print("[leader] bot disabled (no BOT_TOKEN or owner_username)")
+                    until = nowt + BOT_LEASE_TTL
+                    refreshed = True
+                if refreshed:
+                    print(f"[lease] renewed until {until}")
+                    await propagate_bot_lease(NODE_ID, until)
+                    await asyncio.sleep(0.5)
 
-        if (not am) and was_leader:
-            print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
-            print("[leader] stopping bot")
-            await stop_bot()
-            await asyncio.sleep(0.5)
-            coord = lease_coordinator_peer()
-            if coord and coord.get("addr"):
-                await lease_release_from(coord["addr"], NODE_ID)
+        if owner == NODE_ID and not running:
+            print("[leader] starting bot (lease owner)")
+            await start_bot()
 
-        # Продлеваем lease, если мы лидер и владелец
-        coord = lease_coordinator_peer()
-        if am and coord and coord.get("addr"):
-            info = await lease_get_from(coord["addr"])
-            owner = info.get("owner","")
-            until = int(info.get("until",0))
-            if owner == NODE_ID and until - now_s() < BOT_LEASE_TTL // 2:
-                await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
-
-        was_leader = am
+        was_leader = True
         await asyncio.sleep(1.0)
 
 def lease_coordinator_peer() -> Optional[Dict[str, Any]]:
