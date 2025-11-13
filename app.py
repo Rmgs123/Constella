@@ -1169,18 +1169,10 @@ async def start_bot():
         try:
             # Жёстко обрубаем любые висящие getUpdates этим токеном
             try:
-                await BOT.set_webhook(
-                    url="https://example.invalid/constella-cutover",
-                    allowed_updates=[],
-                    drop_pending_updates=True,
-                )
-            except Exception as e:
-                print(f"[bot] pre-start webhook set failed: {e}")
-            await asyncio.sleep(1.0)
-            try:
                 await BOT.delete_webhook(drop_pending_updates=True)
             except Exception as e:
                 print(f"[bot] pre-start delete_webhook failed: {e}")
+            await asyncio.sleep(1.0)
 
             while True:
                 # Выходим, если поколение сменилось
@@ -1237,11 +1229,6 @@ async def start_bot():
         finally:
             # финальная зачистка — рубим webhook и закрываем сессии
             try:
-                await BOT.set_webhook(
-                    url="https://example.invalid/constella-cutover",
-                    allowed_updates=[],
-                    drop_pending_updates=True,
-                )
                 await BOT.delete_webhook(drop_pending_updates=True)
             except Exception as e:
                 print(f"[bot] cleanup webhook error: {e}")
@@ -1268,25 +1255,11 @@ async def stop_bot():
         # 0) мгновенно «инвалидируем» активный цикл
         BOT_RUN_GEN += 1
 
-        # 1) Глобально «переключаем» токен в webhook, чтобы обрубить любые getUpdates
-        try:
-            from aiogram import Bot as _Bot
-            _tmp = _Bot(BOT_TOKEN)
-            print("[bot] stop: set webhook cutover OK")
-            await _tmp.set_webhook(
-                url="https://example.invalid/constella-stop",
-                allowed_updates=[],
-                drop_pending_updates=True
-            )
-            await _tmp.session.close()
-        except Exception as e:
-            print(f"[bot] stop: set webhook failed: {e}")
-
-        # 2) Просим polling завершиться корректно и ждём таск
+        # 1) Просим polling завершиться корректно и ждём таск
         try:
             if DP is not None:
                 print("[bot] stop: DP.stop_polling() sent")
-                DP.stop_polling()
+                await DP.stop_polling()
         except Exception as e:
             print(f"[bot] stop: DP.stop_polling error: {e}")
         task = BOT_TASK
@@ -1297,15 +1270,19 @@ async def stop_bot():
             except asyncio.CancelledError:
                 pass
 
-        # 3) Убираем webhook — следующий лидер начнёт polling без конфликта
+        # 2) Убираем webhook — следующий лидер начнёт polling без конфликта
         try:
             from aiogram import Bot as _Bot2
             _tmp2 = _Bot2(BOT_TOKEN)
-            print("[bot] stop: delete_webhook OK")
-            await _tmp2.delete_webhook(drop_pending_updates=True)
-            await _tmp2.session.close()
+            try:
+                await _tmp2.delete_webhook(drop_pending_updates=True)
+                print("[bot] stop: delete_webhook OK")
+            except Exception as e:
+                print(f"[bot] stop: delete_webhook failed: {e}")
+            finally:
+                await _tmp2.session.close()
         except Exception as e:
-            print(f"[bot] stop: delete_webhook failed: {e}")
+            print(f"[bot] stop: delete_webhook error: {e}")
 
         BOT_TASK = None
         DP = None
