@@ -7,12 +7,7 @@ import psutil
 import logging
 
 from collections import deque
-import io
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from aiogram.types import BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 
 # Зарефакторить код
@@ -47,6 +42,7 @@ CPU_SAMPLES = deque(maxlen=_MAX_POINTS)           # [(ts, cpu_pct)]
 NET_DOWN_SAMPLES = deque(maxlen=_MAX_POINTS)      # [(ts, mbps)]
 NET_UP_SAMPLES = deque(maxlen=_MAX_POINTS)        # [(ts, mbps)]
 SPEEDTEST_LOCK = asyncio.Lock()
+METRICS_SUMMARY_POINTS = int(os.environ.get("METRICS_SUMMARY_POINTS", "12"))
 
 # Секрет сети (для HMAC подписи). В init задаётся; при join — приходит от seed.
 NETWORK_ID = os.environ.get("NETWORK_ID", "")
@@ -61,7 +57,12 @@ rpc_logger = logging.getLogger("constella.rpc")
 # Тайминги
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "2.0"))
 DOWN_AFTER_MISSES = int(os.environ.get("DOWN_AFTER_MISSES", "3"))
+HEARTBEAT_TIMEOUT = float(os.environ.get(
+    "HEARTBEAT_TIMEOUT",
+    str(max(1, DOWN_AFTER_MISSES) * HEARTBEAT_INTERVAL),
+))
 RPC_TIMEOUT = float(os.environ.get("RPC_TIMEOUT", "3.0"))
+SPEEDTEST_RPC_TIMEOUT = float(os.environ.get("SPEEDTEST_RPC_TIMEOUT", "45.0"))
 CLOCK_SKEW = int(os.environ.get("CLOCK_SKEW", "15"))  # сек, допускаемая рассинхронизация в RPC
 
 LEADER_GRACE_SEC = float(os.environ.get("LEADER_GRACE_SEC", str(DOWN_AFTER_MISSES*HEARTBEAT_INTERVAL + 2.0)))
@@ -84,7 +85,7 @@ def save_json(path: str, data: Any):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-async def run_local_speedtest() -> Dict[str, Any]:
+def _run_speedtest_blocking() -> Dict[str, Any]:
     try:
         import speedtest
     except Exception:
@@ -95,33 +96,26 @@ async def run_local_speedtest() -> Dict[str, Any]:
         down = st.download() / 1e6  # Mbps
         up = st.upload() / 1e6      # Mbps
         ping = st.results.ping
-        return {"ok": True, "down_mbps": round(down, 2), "up_mbps": round(up, 2), "ping_ms": round(ping, 1)}
+        return {
+            "ok": True,
+            "down_mbps": round(down, 2),
+            "up_mbps": round(up, 2),
+            "ping_ms": round(ping, 1),
+        }
     except Exception as e:
         return {"ok": False, "error": f"{e}"}
+
+
+async def run_local_speedtest() -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _run_speedtest_blocking)
+    except Exception as e:
+        return {"ok": False, "error": f"executor_error:{e}"}
 
 def _filter_last_hours(samples: deque, hours: int) -> list[tuple[int, float]]:
     cutoff = now_s() - hours * 3600
     return [(ts, v) for ts, v in samples if ts >= cutoff]
-
-def render_timeseries_png(title: str, series: list[tuple[int, float]], ylabel: str) -> bytes:
-    if not series:
-        series = [(now_s(), 0.0)]
-    xs = [ts for ts, _ in series]
-    ys = [v for _, v in series]
-    # к секундам добавим человеческие подписи
-    plt.figure(figsize=(10, 4), dpi=160)
-    plt.plot(xs, ys, linewidth=2)
-    plt.title(title)
-    plt.ylabel(ylabel)
-    plt.xlabel("time")
-    plt.grid(True, alpha=0.3)
-    # автолэйаут и сохранение в буфер
-    buf = io.BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
-    return buf.read()
 
 async def telemetry_loop():
     # Первичный быстрый замер CPU, потом каждые SAMPLE_EVERY_SEC
@@ -140,13 +134,19 @@ async def telemetry_loop():
         if ENABLE_BG_SPEEDTEST and not SPEEDTEST_LOCK.locked():
             async with SPEEDTEST_LOCK:
                 res = await run_local_speedtest()
-                if res.get("ok"):
-                    NET_DOWN_SAMPLES.append((now_s(), float(res["down_mbps"])))
-                    NET_UP_SAMPLES.append((now_s(), float(res["up_mbps"])))
-                else:
-                    # фиксируем 0 чтобы график не рвался
-                    NET_DOWN_SAMPLES.append((now_s(), 0.0))
-                    NET_UP_SAMPLES.append((now_s(), 0.0))
+            if res.get("ok"):
+                ts_now = now_s()
+                NET_DOWN_SAMPLES.append((ts_now, float(res["down_mbps"])))
+                NET_UP_SAMPLES.append((ts_now, float(res["up_mbps"])))
+                logger.debug(
+                    "background speedtest ok",
+                    extra={"down": res.get("down_mbps"), "up": res.get("up_mbps"), "ping": res.get("ping_ms")},
+                )
+            else:
+                logger.warning(
+                    "background speedtest failed",
+                    extra={"error": res.get("error")},
+                )
         await asyncio.sleep(SAMPLE_EVERY_SEC)
 
 # Сетевое общее состояние (кэш на узле)
@@ -238,13 +238,24 @@ def upsert_peer(p: Dict[str, Any]):
         state["peers"].append(cur.copy())
     save_json(STATE_FILE, state)
 
+def is_peer_online(last_seen: Optional[int], *, now: Optional[int] = None) -> bool:
+    if last_seen is None:
+        return False
+    if now is None:
+        now = now_s()
+    try:
+        last = int(last_seen)
+    except (TypeError, ValueError):
+        return False
+    if last <= 0:
+        return False
+    return (now - last) <= HEARTBEAT_TIMEOUT
+
 def get_alive_peers() -> List[Dict[str, Any]]:
     alive = []
     now = now_s()
     for p in [*peers.values(), self_peer]:
-        last = p.get("last_seen", 0)
-        misses = max(0, int((now - last) // HEARTBEAT_INTERVAL))
-        status = "alive" if misses < DOWN_AFTER_MISSES else "offline"
+        status = "alive" if is_peer_online(p.get("last_seen"), now=now) else "offline"
         p["status"] = status
         if status == "alive":
             alive.append(p)
@@ -583,14 +594,39 @@ async def rpc(req):
     elif method == "RunSpeedtest":
         # принудительный спидтест «сейчас»
         if SPEEDTEST_LOCK.locked():
+            rpc_logger.warning(
+                "RunSpeedtest rejected: already running",
+                extra={"server": SERVER_NAME},
+            )
             return web.json_response({"ok": False, "error": "another speedtest running"})
+        started = time.time()
         async with SPEEDTEST_LOCK:
-            res = await run_local_speedtest()
+            rpc_logger.info("RunSpeedtest local start", extra={"server": SERVER_NAME})
+            try:
+                res = await run_local_speedtest()
+            except Exception as e:
+                rpc_logger.exception("RunSpeedtest local exception", extra={"server": SERVER_NAME})
+                res = {"ok": False, "error": f"internal_error:{e}"}
+        duration_ms = int((time.time() - started) * 1000)
         if res.get("ok"):
-            # добавим точку в локальную серию
             ts = now_s()
             NET_DOWN_SAMPLES.append((ts, float(res["down_mbps"])))
             NET_UP_SAMPLES.append((ts, float(res["up_mbps"])))
+            rpc_logger.info(
+                "RunSpeedtest local success",
+                extra={
+                    "server": SERVER_NAME,
+                    "duration_ms": duration_ms,
+                    "down": res.get("down_mbps"),
+                    "up": res.get("up_mbps"),
+                    "ping": res.get("ping_ms"),
+                },
+            )
+        else:
+            rpc_logger.warning(
+                "RunSpeedtest local failed",
+                extra={"server": SERVER_NAME, "duration_ms": duration_ms, "error": res.get("error")},
+            )
         return web.json_response(res)
 
     else:
@@ -662,7 +698,7 @@ async def rpc_get_ts(addr: str, kind: str, hours: int = 6) -> Dict[str, Any]:
     return await call_rpc(addr, "GetTS", {"kind": kind, "hours": hours})
 
 async def rpc_speedtest(addr: str) -> Dict[str, Any]:
-    return await call_rpc(addr, "RunSpeedtest", {})
+    return await call_rpc(addr, "RunSpeedtest", {}, timeout=SPEEDTEST_RPC_TIMEOUT)
 
 async def propagate_new_peer(new_peer):
     """Рассылаем информацию о новом пире всем живым узлам"""
@@ -689,7 +725,7 @@ async def async_reboot():
 # ----------------------------
 # Клиентские вызовы (RPC)
 # ----------------------------
-async def call_rpc(addr: str, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+async def call_rpc(addr: str, method: str, params: Dict[str, Any], *, timeout: Optional[float] = None) -> Dict[str, Any]:
     if not state.get("network_secret"):
         return {"ok": False, "error": "no_network_secret"}
     payload = {"method": method, "params": params, "ts": now_s()}
@@ -697,7 +733,8 @@ async def call_rpc(addr: str, method: str, params: Dict[str, Any]) -> Dict[str, 
     url = f"http://{addr}/rpc"
     client = await ensure_http_client()
     try:
-        async with client.post(url, json=payload, timeout=ClientTimeout(total=RPC_TIMEOUT)) as r:
+        total = timeout if timeout is not None else RPC_TIMEOUT
+        async with client.post(url, json=payload, timeout=ClientTimeout(total=total)) as r:
             return await r.json()
     except Exception as e:
         return {"ok": False, "error": f"rpc_error:{e}"}
@@ -756,19 +793,26 @@ async def heartbeat_loop():
 
         await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-def peer_status(p: Dict[str, Any]) -> str:
-    last = int(p.get("last_seen", 0) or 0)
-    misses = max(0, int((now_s() - last) // HEARTBEAT_INTERVAL))
-    return "alive" if misses < DOWN_AFTER_MISSES else "offline"
+def peer_status(p: Optional[Dict[str, Any]], *, now: Optional[int] = None) -> str:
+    if not p:
+        return "offline"
+    last_seen = p.get("last_seen")
+    if now is None:
+        now = now_s()
+    return "alive" if is_peer_online(last_seen, now=now) else "offline"
 
 def peers_with_status() -> List[Dict[str, Any]]:
     # объединяем известных пиров и себя; статусы считаем на лету
-    merged = {p.get("node_id",""): dict(p) for p in state.get("peers", [])}
+    merged = {p.get("node_id", ""): dict(p) for p in state.get("peers", [])}
     merged[NODE_ID] = dict(self_peer)
+    now = now_s()
     out = []
     for nid, p in merged.items():
         q = dict(p)
-        q["status"] = peer_status(q)
+        q.setdefault("node_id", nid)
+        name = q.get("name") or q.get("addr") or (q.get("node_id") or "")[:8] or "?"
+        q["name"] = name
+        q["status"] = peer_status(q, now=now)
         out.append(q)
     return out
 
@@ -973,6 +1017,66 @@ async def start_bot():
                 return peer, addr
         return None, None
 
+    def format_server_title(name: str, status: str, is_host: bool) -> str:
+        if status == "alive":
+            suffix = " — *Хост*" if is_host else ""
+            return f"Сервер *{name}*{suffix}"
+        return f"Сервер *{name}* — Offline"
+
+    def describe_server(name: str) -> Tuple[str, Optional[Dict[str, Any]], Optional[str], str, bool]:
+        peer, addr = resolve_target(name)
+        now = now_s()
+        status = peer_status(peer, now=now)
+        is_host = False
+        try:
+            leader = current_leader()
+            if peer and peer.get("node_id") and leader.get("node_id") == peer.get("node_id"):
+                is_host = True
+        except Exception as e:
+            bot_logger.debug(
+                "describe_server: leader lookup failed",
+                extra={"server": name, "error": str(e)},
+            )
+        title = format_server_title(name, status, is_host)
+        if peer is not None:
+            peer = dict(peer)
+            peer["status"] = status
+        return title, peer, addr, status, is_host
+
+    def summarize_series_points(series: List[Tuple[int, Any]], limit: int = METRICS_SUMMARY_POINTS) -> Tuple[int, float, float]:
+        if not series:
+            return 0, 0.0, 0.0
+        ordered = sorted(series, key=lambda x: x[0])
+        trimmed = ordered[-max(1, limit):]
+        values = [float(v) for _, v in trimmed]
+        avg = sum(values) / len(values)
+        max_v = max(values)
+        return len(trimmed), avg, max_v
+
+    def summarize_net_points(
+        down: List[Tuple[int, Any]],
+        up: List[Tuple[int, Any]],
+        limit: int = METRICS_SUMMARY_POINTS,
+    ) -> Tuple[int, float, float]:
+        down_ordered = sorted(down, key=lambda x: x[0]) if down else []
+        up_ordered = sorted(up, key=lambda x: x[0]) if up else []
+        down_trim = down_ordered[-max(1, limit):] if down_ordered else []
+        up_trim = up_ordered[-max(1, limit):] if up_ordered else []
+        avg_down = sum(float(v) for _, v in down_trim) / len(down_trim) if down_trim else 0.0
+        avg_up = sum(float(v) for _, v in up_trim) / len(up_trim) if up_trim else 0.0
+        count = max(len(down_trim), len(up_trim))
+        return count, avg_down, avg_up
+
+    def friendly_error_message(err: Optional[str]) -> str:
+        if not err:
+            return "неизвестная ошибка"
+        text = str(err)
+        if text.startswith("rpc_error:"):
+            text = text.split("rpc_error:", 1)[1]
+        if "timeout" in text.lower():
+            return "таймаут запроса"
+        return text
+
     def build_nodes_page(page: int) -> types.InlineKeyboardMarkup:
         peers = sorted(peers_with_status(), key=lambda p: p.get("name", ""))
         total = len(peers)
@@ -1000,14 +1104,13 @@ async def start_bot():
         return kb.as_markup()
 
     def build_server_menu(name: str) -> types.InlineKeyboardMarkup:
-        peer, _ = resolve_target(name)
-        status = (peer or {}).get("status")
+        _, peer, _, status, _ = describe_server(name)
         alive = status == "alive"
         kb = InlineKeyboardBuilder()
         if alive:
             kb.button(text="📊 Stats", callback_data=f"action:stats:{name}")
             kb.button(text="🌐 Network", callback_data=f"action:net:{name}")
-            kb.button(text="📈 Graph", callback_data=f"action:graphs:{name}")
+            kb.button(text="📈 Metrics", callback_data=f"action:metrics:{name}")
             kb.button(text="🔄 Reboot", callback_data=f"action:reboot:{name}")
             kb.adjust(2, 2)
         else:
@@ -1021,14 +1124,6 @@ async def start_bot():
         kb.button(text="✅ Да, перезагрузить", callback_data=f"action:reboot_yes:{name}")
         kb.button(text="↩️ Отмена", callback_data=f"action:reboot_back:{name}")
         kb.adjust(2)
-        return kb.as_markup()
-
-    def build_graph_menu(name: str) -> types.InlineKeyboardMarkup:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="📈 CPU (6h)", callback_data=f"graph:cpu:{name}")
-        kb.button(text="📈 Network (6h)", callback_data=f"graph:net:{name}")
-        kb.button(text="← Назад", callback_data=f"back:server:{name}")
-        kb.adjust(2, 1)
         return kb.as_markup()
 
     async def ensure_ui_message(m: types.Message) -> tuple[int, dict]:
@@ -1165,15 +1260,8 @@ async def start_bot():
         st = ensure_ui(chat_id)
         st["selected"] = name
         UI[chat_id] = st
-        peer, _ = resolve_target(name)
-        alive = (peer or {}).get("status") == "alive"
-        if not alive:
-            text = f"Сервер *{name}*: Offline"
-        else:
-            is_host = (current_leader().get("node_id") == peer.get("node_id")) if peer else False
-            tag = " — *Хост*" if is_host else ""
-            text = f"Сервер *{name}*{tag}"
-        await update_ui_from_callback(q, st, text, build_server_menu(name), parse_mode="Markdown")
+        title, _, _, _, _ = describe_server(name)
+        await update_ui_from_callback(q, st, title, build_server_menu(name), parse_mode="Markdown")
         await q.answer()
 
     @DP.callback_query(F.data.startswith("action:stats:"))
@@ -1194,10 +1282,17 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        peer, addr = resolve_target(target)
-        if not addr:
-            bot_logger.warning("stats: address missing", extra={"server": target})
-            await q.answer("Сервер не найден", show_alert=True)
+        title, _, addr, status, _ = describe_server(target)
+        if status != "alive" or not addr:
+            bot_logger.warning("stats: server offline or address missing", extra={"server": target, "status": status, "addr": addr})
+            await update_ui_from_callback(
+                q,
+                st,
+                format_server_title(target, status, False),
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Сервер оффлайн", show_alert=True)
             return
         rpc_logger.info("RPC GetStats request", extra={"server": target, "addr": addr})
         started = time.time()
@@ -1209,11 +1304,14 @@ async def start_bot():
                 extra={"server": target, "addr": addr, "duration_ms": duration_ms},
             )
             s = res["stats"]
-            text = (f"*{s['server_name']}*\n"
-                    f"Uptime: {s['uptime_s']}s\n"
-                    f"CPU: {', '.join(str(x) + '%' for x in s['cpu_per_core_pct'])}\n"
-                    f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
-                    f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
+            cpu_info = ", ".join(f"{x}%" for x in s['cpu_per_core_pct'])
+            text = (
+                f"{title}\n\n"
+                f"Uptime: {s['uptime_s']}s\n"
+                f"CPU: {cpu_info}\n"
+                f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
+                f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)"
+            )
             await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
             await q.answer()
         else:
@@ -1222,14 +1320,15 @@ async def start_bot():
                 "RPC GetStats failed",
                 extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
             )
+            friendly = friendly_error_message(err)
             await update_ui_from_callback(
                 q,
                 st,
-                f"Сервер *{target}*\nОшибка получения статуса: {err}",
+                f"{title}\nОшибка получения статуса: {friendly}",
                 build_server_menu(target),
                 parse_mode="Markdown",
             )
-            await q.answer(f"Ошибка: {err}", show_alert=True)
+            await q.answer(f"Ошибка: {friendly}", show_alert=True)
 
     @DP.callback_query(F.data.startswith("action:reboot:"))
     @only_owner
@@ -1249,7 +1348,28 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        await update_ui_from_callback(q, st, f"Перезагрузить *{target}*?", build_reboot_confirm(target), parse_mode="Markdown")
+        title, _, addr, status, is_host = describe_server(target)
+        if status != "alive" or not addr:
+            bot_logger.warning(
+                "reboot confirm: server offline or address missing",
+                extra={"server": target, "status": status, "addr": addr},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                format_server_title(target, status, is_host),
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Сервер оффлайн", show_alert=True)
+            return
+        await update_ui_from_callback(
+            q,
+            st,
+            f"{title}\n\nПерезагрузить этот сервер?",
+            build_reboot_confirm(target),
+            parse_mode="Markdown",
+        )
         await q.answer()
 
     @DP.callback_query(F.data.startswith("action:reboot_back:"))
@@ -1270,7 +1390,8 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        await update_ui_from_callback(q, st, f"Сервер *{target}*", build_server_menu(target), parse_mode="Markdown")
+        title, _, _, _, _ = describe_server(target)
+        await update_ui_from_callback(q, st, title, build_server_menu(target), parse_mode="Markdown")
         await q.answer()
 
     @DP.callback_query(F.data.startswith("action:reboot_yes:"))
@@ -1291,10 +1412,17 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        peer, addr = resolve_target(target)
-        if not addr:
-            bot_logger.warning("reboot: address missing", extra={"server": target})
-            await q.answer("Сервер не найден", show_alert=True)
+        title, _, addr, status, is_host = describe_server(target)
+        if status != "alive" or not addr:
+            bot_logger.warning("reboot: server offline or address missing", extra={"server": target, "status": status, "addr": addr})
+            await update_ui_from_callback(
+                q,
+                st,
+                format_server_title(target, status, is_host),
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Сервер оффлайн", show_alert=True)
             return
         rpc_logger.info("RPC Reboot request", extra={"server": target, "addr": addr})
         started = time.time()
@@ -1308,7 +1436,7 @@ async def start_bot():
             await update_ui_from_callback(
                 q,
                 st,
-                f"Отправлена команда перезагрузки *{target}*…",
+                f"{title}\nОтправлена команда перезагрузки…",
                 build_server_menu(target),
                 parse_mode="Markdown",
             )
@@ -1319,14 +1447,15 @@ async def start_bot():
                 "RPC Reboot failed",
                 extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
             )
+            friendly = friendly_error_message(err)
             await update_ui_from_callback(
                 q,
                 st,
-                f"Сервер *{target}*\nОшибка перезагрузки: {err}",
+                f"{title}\nОшибка перезагрузки: {friendly}",
                 build_server_menu(target),
                 parse_mode="Markdown",
             )
-            await q.answer(f"Ошибка: {err}", show_alert=True)
+            await q.answer(f"Ошибка: {friendly}", show_alert=True)
 
     @DP.callback_query(F.data.startswith("action:net:"))
     @only_owner
@@ -1346,18 +1475,28 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
+        title, _, addr, status, is_host = describe_server(target)
+        if status != "alive" or not addr:
+            bot_logger.warning(
+                "speedtest: server offline or address missing",
+                extra={"server": target, "status": status, "addr": addr},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                format_server_title(target, status, is_host),
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Сервер оффлайн", show_alert=True)
+            return
         await update_ui_from_callback(
             q,
             st,
-            f"Сервер *{target}*\nВыполняю спидтест…",
+            f"{title}\nВыполняю спидтест…",
             build_server_menu(target),
             parse_mode="Markdown",
         )
-        peer, addr = resolve_target(target)
-        if not addr:
-            bot_logger.warning("speedtest: address missing", extra={"server": target})
-            await q.answer("Сервер не найден", show_alert=True)
-            return
         rpc_logger.info("RPC RunSpeedtest request", extra={"server": target, "addr": addr})
         started = time.time()
         res = await rpc_speedtest(addr)
@@ -1368,7 +1507,7 @@ async def start_bot():
                 extra={"server": target, "addr": addr, "duration_ms": duration_ms, "down": res.get("down_mbps"), "up": res.get("up_mbps"), "ping": res.get("ping_ms")},
             )
             text = (
-                f"Сервер *{target}*\n"
+                f"{title}\n"
                 f"↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms"
             )
             await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
@@ -1379,19 +1518,20 @@ async def start_bot():
                 "RPC RunSpeedtest failed",
                 extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
             )
+            friendly = friendly_error_message(err)
             await update_ui_from_callback(
                 q,
                 st,
-                f"Сервер *{target}*\nОшибка спидтеста: {err}",
+                f"{title}\nОшибка спидтеста: {friendly}",
                 build_server_menu(target),
                 parse_mode="Markdown",
             )
-            await q.answer(f"Ошибка: {err}", show_alert=True)
+            await q.answer(f"Ошибка: {friendly}", show_alert=True)
 
-    @DP.callback_query(F.data.startswith("action:graphs:"))
+    @DP.callback_query(F.data.startswith("action:metrics:"))
     @only_owner
-    @bot_action("callback:graphs_menu")
-    async def cb_graphs_menu(q: types.CallbackQuery):
+    @bot_action("callback:metrics")
+    async def cb_metrics(q: types.CallbackQuery):
         if not q.message:
             await q.answer("Нет сообщения", show_alert=True)
             return
@@ -1405,124 +1545,89 @@ async def start_bot():
         UI[chat_id] = st
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        title, peer, addr, status, is_host = describe_server(target)
+        if status != "alive" or not addr:
+            bot_logger.warning(
+                "metrics: server offline or address missing",
+                extra={"server": target, "status": status, "addr": addr},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                format_server_title(target, status, is_host),
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Сервер оффлайн", show_alert=True)
             return
         await update_ui_from_callback(
             q,
             st,
-            f"Сервер *{target}* — раздел графиков",
-            build_graph_menu(target),
+            f"{title}\nПолучаю историю метрик…",
+            build_server_menu(target),
             parse_mode="Markdown",
         )
-        await q.answer()
 
-    @DP.callback_query(F.data.startswith("graph:cpu:"))
-    @only_owner
-    @bot_action("callback:graph_cpu")
-    async def cb_graph_cpu(q: types.CallbackQuery):
-        if not q.message:
-            await q.answer("Нет сообщения", show_alert=True)
-            return
-        parts = q.data.split(":", 2)
-        target = parts[2] if len(parts) > 2 else ""
-        chat_id = q.message.chat.id
-        st = ensure_ui(chat_id)
-        if target:
-            st["selected"] = target
-        target = st.get("selected")
-        UI[chat_id] = st
-        if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True)
-            return
-        peer, addr = resolve_target(target)
-        if not addr:
-            bot_logger.warning("graph cpu: address missing", extra={"server": target})
-            await q.answer("Сервер не найден", show_alert=True)
-            return
+        cpu_started = time.time()
         rpc_logger.info("RPC GetTS(cpu) request", extra={"server": target, "addr": addr})
-        started = time.time()
-        res = await rpc_get_ts(addr, "cpu", hours=6)
-        duration_ms = int((time.time() - started) * 1000)
-        if not res.get("ok"):
-            err = res.get("error")
+        cpu_res = await rpc_get_ts(addr, "cpu", hours=6)
+        cpu_duration_ms = int((time.time() - cpu_started) * 1000)
+        if cpu_res.get("ok"):
+            rpc_logger.info(
+                "RPC GetTS(cpu) ok",
+                extra={"server": target, "addr": addr, "duration_ms": cpu_duration_ms, "points": len(cpu_res.get("series", []))},
+            )
+        else:
             rpc_logger.error(
                 "RPC GetTS(cpu) failed",
-                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+                extra={"server": target, "addr": addr, "duration_ms": cpu_duration_ms, "error": cpu_res.get("error")},
             )
-            await q.answer(f"Ошибка: {err}", show_alert=True)
-            return
-        rpc_logger.info(
-            "RPC GetTS(cpu) ok",
-            extra={"server": target, "addr": addr, "duration_ms": duration_ms, "points": len(res.get("series", []))},
-        )
-        img_bytes = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
-        bot_logger.info("graph cpu generated", extra={"server": target, "bytes": len(img_bytes)})
-        img = BufferedInputFile(img_bytes, filename="cpu.png")
-        await q.message.answer_photo(img)
-        bot_logger.info("graph cpu sent", extra={"server": target})
-        await q.answer("График отправлен")
 
-    @DP.callback_query(F.data.startswith("graph:net:"))
-    @only_owner
-    @bot_action("callback:graph_net")
-    async def cb_graph_net(q: types.CallbackQuery):
-        if not q.message:
-            await q.answer("Нет сообщения", show_alert=True)
-            return
-        parts = q.data.split(":", 2)
-        target = parts[2] if len(parts) > 2 else ""
-        chat_id = q.message.chat.id
-        st = ensure_ui(chat_id)
-        if target:
-            st["selected"] = target
-        target = st.get("selected")
-        UI[chat_id] = st
-        if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True)
-            return
-        peer, addr = resolve_target(target)
-        if not addr:
-            bot_logger.warning("graph net: address missing", extra={"server": target})
-            await q.answer("Сервер не найден", show_alert=True)
-            return
+        net_started = time.time()
         rpc_logger.info("RPC GetTS(net) request", extra={"server": target, "addr": addr})
-        started = time.time()
-        res = await rpc_get_ts(addr, "net", hours=6)
-        duration_ms = int((time.time() - started) * 1000)
-        if not res.get("ok"):
-            err = res.get("error")
+        net_res = await rpc_get_ts(addr, "net", hours=6)
+        net_duration_ms = int((time.time() - net_started) * 1000)
+        if net_res.get("ok"):
+            rpc_logger.info(
+                "RPC GetTS(net) ok",
+                extra={
+                    "server": target,
+                    "addr": addr,
+                    "duration_ms": net_duration_ms,
+                    "down_points": len(net_res.get("down", [])),
+                    "up_points": len(net_res.get("up", [])),
+                },
+            )
+        else:
             rpc_logger.error(
                 "RPC GetTS(net) failed",
-                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+                extra={"server": target, "addr": addr, "duration_ms": net_duration_ms, "error": net_res.get("error")},
             )
-            await q.answer(f"Ошибка: {err}", show_alert=True)
-            return
-        rpc_logger.info(
-            "RPC GetTS(net) ok",
-            extra={"server": target, "addr": addr, "duration_ms": duration_ms, "down_points": len(res.get("down", [])), "up_points": len(res.get("up", []))},
-        )
-        down = res.get("down", [])
-        up = res.get("up", [])
-        plt.figure(figsize=(10, 4), dpi=160)
-        if down:
-            plt.plot([x for x, _ in down], [y for _, y in down], linewidth=2, label="↓ Mbit/s")
-        if up:
-            plt.plot([x for x, _ in up], [y for _, y in up], linewidth=2, label="↑ Mbit/s")
-        plt.title(f"Network — {target} (6h)")
-        plt.ylabel("Mbit/s")
-        plt.xlabel("time")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format="png")
-        plt.close()
-        buf.seek(0)
-        data = buf.getvalue()
-        bot_logger.info("graph net generated", extra={"server": target, "bytes": len(data)})
-        img = BufferedInputFile(data, filename="network.png")
-        await q.message.answer_photo(img)
-        bot_logger.info("graph net sent", extra={"server": target})
-        await q.answer("График отправлен")
+
+        cpu_line: str
+        if cpu_res.get("ok"):
+            count, avg_cpu, max_cpu = summarize_series_points(cpu_res.get("series", []))
+            if count:
+                cpu_line = f"CPU (посл. {count}): ср. {avg_cpu:.1f}% • макс {max_cpu:.1f}%"
+            else:
+                cpu_line = "CPU: данных нет"
+        else:
+            cpu_line = f"CPU: ошибка {friendly_error_message(cpu_res.get('error'))}"
+
+        net_line: str
+        if net_res.get("ok"):
+            count, avg_down, avg_up = summarize_net_points(net_res.get("down", []), net_res.get("up", []))
+            if count:
+                net_line = f"Сеть (посл. {count}): ср. ↓ {avg_down:.1f} Mbit/s • ср. ↑ {avg_up:.1f} Mbit/s"
+            else:
+                net_line = "Сеть: данных нет"
+        else:
+            net_line = f"Сеть: ошибка {friendly_error_message(net_res.get('error'))}"
+
+        text = f"{title}\n\n{cpu_line}\n{net_line}"
+        await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
+        await q.answer("Готово")
 
     @DP.callback_query(F.data == "back:nodes")
     @only_owner
@@ -1556,7 +1661,8 @@ async def start_bot():
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        await update_ui_from_callback(q, st, f"Сервер *{target}*", build_server_menu(target), parse_mode="Markdown")
+        title, _, _, _, _ = describe_server(target)
+        await update_ui_from_callback(q, st, title, build_server_menu(target), parse_mode="Markdown")
         await q.answer()
 
     @DP.message(Command("invite"))
