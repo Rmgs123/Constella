@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import asyncio, json, os, hmac, hashlib, time, uuid, signal, sys, secrets
 from typing import Dict, Any, List, Optional, Tuple
+from functools import wraps
 from aiohttp import web, ClientSession, ClientTimeout
 import psutil
+import logging
 
 from collections import deque
 import io
@@ -49,6 +51,12 @@ SPEEDTEST_LOCK = asyncio.Lock()
 # Секрет сети (для HMAC подписи). В init задаётся; при join — приходит от seed.
 NETWORK_ID = os.environ.get("NETWORK_ID", "")
 NETWORK_SECRET = os.environ.get("NETWORK_SECRET", "")
+
+# Логи
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("constella")
+bot_logger = logging.getLogger("constella.bot")
+rpc_logger = logging.getLogger("constella.rpc")
 
 # Тайминги
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "2.0"))
@@ -257,19 +265,53 @@ def i_am_leader() -> bool:
     L = current_leader()
     return L.get("node_id") == NODE_ID
 
-async def safe_edit(msg, text: str, *, reply_markup=None, parse_mode=None):
+async def safe_edit(msg, text: str, *, reply_markup=None, parse_mode=None) -> bool:
+    """Edit a message in place, tolerating common Telegram errors."""
     try:
         await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return True
     except TelegramBadRequest as e:
-        # Игнорируем "message is not modified"
-        if "message is not modified" in str(e):
+        err = str(e)
+        if "message is not modified" in err:
+            bot_logger.debug("safe_edit: message already up-to-date", extra={"chat_id": msg.chat.id, "message_id": msg.message_id})
             if reply_markup is not None:
                 try:
                     await msg.edit_reply_markup(reply_markup)
-                except TelegramBadRequest:
-                    pass
-        else:
-            raise
+                except TelegramBadRequest as e2:
+                    bot_logger.debug("safe_edit: reply_markup already up-to-date", extra={"chat_id": msg.chat.id, "message_id": msg.message_id, "error": str(e2)})
+            return True
+        if any(key in err.lower() for key in ["message to edit not found", "message can't be edited", "message_id_invalid"]):
+            bot_logger.warning("safe_edit: target message unavailable", extra={"chat_id": msg.chat.id, "message_id": msg.message_id, "error": err})
+            return False
+        bot_logger.warning("safe_edit: unexpected Telegram error", extra={"chat_id": msg.chat.id, "message_id": msg.message_id, "error": err})
+        raise
+    except Exception as e:
+        bot_logger.exception("safe_edit: unexpected exception", extra={"chat_id": getattr(msg.chat, 'id', None), "message_id": getattr(msg, 'message_id', None)})
+        raise
+
+async def safe_edit_message(bot, chat_id: int, message_id: int, text: str, *, reply_markup=None, parse_mode=None) -> bool:
+    """Same as safe_edit but operates on chat/message ids."""
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return True
+    except TelegramBadRequest as e:
+        err = str(e)
+        if "message is not modified" in err:
+            bot_logger.debug("safe_edit_message: message already up-to-date", extra={"chat_id": chat_id, "message_id": message_id})
+            if reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+                except TelegramBadRequest as e2:
+                    bot_logger.debug("safe_edit_message: reply_markup already up-to-date", extra={"chat_id": chat_id, "message_id": message_id, "error": str(e2)})
+            return True
+        if any(key in err.lower() for key in ["message to edit not found", "message can't be edited", "message_id_invalid"]):
+            bot_logger.warning("safe_edit_message: target message unavailable", extra={"chat_id": chat_id, "message_id": message_id, "error": err})
+            return False
+        bot_logger.warning("safe_edit_message: unexpected Telegram error", extra={"chat_id": chat_id, "message_id": message_id, "error": err})
+        raise
+    except Exception:
+        bot_logger.exception("safe_edit_message: unexpected exception", extra={"chat_id": chat_id, "message_id": message_id})
+        raise
 
 # ----------------------------
 # Метрики
@@ -841,19 +883,95 @@ async def start_bot():
         BOT_RUNNING_OWNER = NODE_ID
 
     owner = normalized_owner()
+
+    def describe_user(obj) -> str:
+        user = getattr(obj, "from_user", None)
+        if not user:
+            return "unknown"
+        if user.username:
+            return f"@{user.username}"
+        return f"id:{user.id}"
+
+    def event_chat_id(obj) -> Optional[int]:
+        if isinstance(obj, types.Message):
+            return obj.chat.id
+        if isinstance(obj, types.CallbackQuery) and obj.message:
+            return obj.message.chat.id
+        return None
+
     def only_owner(handler):
-        async def wrapper(m: types.Message, *a, **k):
-            u = (m.from_user.username or "").lower()
-            if u.lower() != owner.lower():
+        @wraps(handler)
+        async def wrapper(event, *a, **k):
+            user = getattr(event, "from_user", None)
+            username = (user.username or "").lower() if user and user.username else ""
+            if owner and username != owner.lower():
+                bot_logger.debug(
+                    "ignore interaction from non-owner",
+                    extra={"chat_id": event_chat_id(event), "user": describe_user(event)},
+                )
+                if isinstance(event, types.CallbackQuery):
+                    try:
+                        await event.answer("Доступ запрещён", show_alert=True)
+                    except Exception:
+                        pass
                 return
-            return await handler(m)
+            return await handler(event, *a, **k)
         return wrapper
+
+    def bot_action(action_name: str):
+        def decorator(func):
+            @wraps(func)
+            async def wrapper(event, *a, **k):
+                chat_id = event_chat_id(event)
+                data = getattr(event, "data", None)
+                bot_logger.info(
+                    f"action {action_name}",
+                    extra={"chat_id": chat_id, "data": data, "user": describe_user(event)},
+                )
+                try:
+                    return await func(event, *a, **k)
+                except Exception as e:
+                    bot_logger.exception(
+                        f"action {action_name} failed",
+                        extra={"chat_id": chat_id, "data": data, "user": describe_user(event)},
+                    )
+                    if isinstance(event, types.CallbackQuery):
+                        try:
+                            await event.answer(f"Ошибка: {e}", show_alert=True)
+                        except Exception:
+                            pass
+                    return
+            return wrapper
+        return decorator
 
     def peers_with_status():
         # берём state.peers + self_peer, обновл. статус уже делает heartbeat_loop
         d = {p.get("node_id", ""): p for p in state.get("peers", [])}
         d[NODE_ID] = self_peer
         return list(d.values())
+
+    def ensure_ui(chat_id: int) -> dict:
+        st = UI.get(chat_id)
+        if not st:
+            st = {"msg_id": 0, "page": 0, "selected": None}
+            UI[chat_id] = st
+        return st
+
+    def resolve_target(name: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if not name:
+            return None, None
+        if name == SERVER_NAME:
+            peer = dict(self_peer)
+            peer["status"] = "alive"
+            peer["addr"] = LISTEN_ADDR
+            return peer, LISTEN_ADDR
+        for peer in peers_with_status():
+            if peer.get("name") == name:
+                addr = peer.get("addr")
+                if peer.get("node_id") == NODE_ID and not addr:
+                    addr = LISTEN_ADDR
+                return peer, addr
+        return None, None
 
     def build_nodes_page(page: int) -> types.InlineKeyboardMarkup:
         peers = sorted(peers_with_status(), key=lambda p: p.get("name", ""))
@@ -863,11 +981,13 @@ async def start_bot():
         kb = InlineKeyboardBuilder()
         for p in chunk:
             name = p.get("name")
-            status = p.get("status", "unknown")
-            tag = " 🟢" if status == "alive" else " 🔴"
-            kb.button(text=f"{name}{tag}", callback_data=f"server:{name}")
-        kb.adjust(2)  # 2 столбца
-        # пагинация
+            status = (p.get("status") or "").lower()
+            icon = "🟢" if status == "alive" else "🔴"
+            kb.button(text=f"{icon} {name}", callback_data=f"server:{name}")
+        if chunk:
+            kb.adjust(2)
+        else:
+            kb.adjust(1)
         pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
         if pages > 1:
             nav = InlineKeyboardBuilder()
@@ -880,8 +1000,9 @@ async def start_bot():
         return kb.as_markup()
 
     def build_server_menu(name: str) -> types.InlineKeyboardMarkup:
-        p = next((x for x in peers_with_status() if x.get("name") == name), None)
-        alive = (p and p.get("status") == "alive")
+        peer, _ = resolve_target(name)
+        status = (peer or {}).get("status")
+        alive = status == "alive"
         kb = InlineKeyboardBuilder()
         if alive:
             kb.button(text="📊 Stats", callback_data=f"action:stats:{name}")
@@ -895,245 +1016,492 @@ async def start_bot():
         kb.button(text="← Назад к списку", callback_data="back:nodes")
         return kb.as_markup()
 
-    def build_reboot_confirm() -> types.InlineKeyboardMarkup:
+    def build_reboot_confirm(name: str) -> types.InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
-        kb.button(text="✅ Да, перезагрузить", callback_data="action:reboot_yes")
-        kb.button(text="↩️ Отмена", callback_data="action:reboot_back")
+        kb.button(text="✅ Да, перезагрузить", callback_data=f"action:reboot_yes:{name}")
+        kb.button(text="↩️ Отмена", callback_data=f"action:reboot_back:{name}")
         kb.adjust(2)
         return kb.as_markup()
 
-    def build_graph_menu() -> types.InlineKeyboardMarkup:
+    def build_graph_menu(name: str) -> types.InlineKeyboardMarkup:
         kb = InlineKeyboardBuilder()
-        kb.button(text="📈 CPU (6h)", callback_data="graph:cpu")
-        kb.button(text="📈 Network (6h)", callback_data="graph:net")
-        kb.button(text="← Назад", callback_data="back:server")
+        kb.button(text="📈 CPU (6h)", callback_data=f"graph:cpu:{name}")
+        kb.button(text="📈 Network (6h)", callback_data=f"graph:net:{name}")
+        kb.button(text="← Назад", callback_data=f"back:server:{name}")
         kb.adjust(2, 1)
         return kb.as_markup()
 
     async def ensure_ui_message(m: types.Message) -> tuple[int, dict]:
-        st = UI.get(m.chat.id, {"msg_id": 0, "page": 0, "selected": None})
-        UI[m.chat.id] = st
+        chat_id = m.chat.id
+        st = ensure_ui(chat_id)
         if st["msg_id"]:
+            bot_logger.debug(
+                "ensure_ui_message: reuse",
+                extra={"chat_id": chat_id, "message_id": st["msg_id"]},
+            )
             return st["msg_id"], st
         sent = await m.answer("Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
         st["msg_id"] = sent.message_id
+        UI[chat_id] = st
+        bot_logger.info(
+            "ensure_ui_message: created",
+            extra={"chat_id": chat_id, "message_id": st["msg_id"]},
+        )
         return st["msg_id"], st
 
-    async def edit_ui(bot: "Bot", chat_id: int, st: dict, text: str, kb: types.InlineKeyboardMarkup):
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=st["msg_id"], text=text, reply_markup=kb
-            )
-        except Exception:
-            # если сообщение потеряно (удалено), создадим заново
-            sent = await bot.send_message(chat_id, text, reply_markup=kb)
-            st["msg_id"] = sent.message_id
+    async def edit_ui(bot: "Bot", chat_id: int, st: dict, text: str, kb: types.InlineKeyboardMarkup, *, parse_mode=None):
+        msg_id = st.get("msg_id")
+        if msg_id:
+            ok = await safe_edit_message(bot, chat_id, msg_id, text, reply_markup=kb, parse_mode=parse_mode)
+            if ok:
+                return
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except TelegramBadRequest as e:
+                bot_logger.debug(
+                    "edit_ui: failed to delete old message",
+                    extra={"chat_id": chat_id, "message_id": msg_id, "error": str(e)},
+                )
+            except Exception:
+                bot_logger.debug(
+                    "edit_ui: unexpected delete error",
+                    extra={"chat_id": chat_id, "message_id": msg_id},
+                )
+        sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode=parse_mode)
+        st["msg_id"] = sent.message_id
+        UI[chat_id] = st
+        bot_logger.info(
+            "edit_ui: sent new ui message",
+            extra={"chat_id": chat_id, "message_id": st["msg_id"]},
+        )
+
+    async def update_ui_from_callback(q: types.CallbackQuery, st: dict, text: str, kb: types.InlineKeyboardMarkup, *, parse_mode=None):
+        if not q.message:
+            bot_logger.warning("update_ui_from_callback without message", extra={"user": describe_user(q)})
+            return
+        ok = await safe_edit(q.message, text, reply_markup=kb, parse_mode=parse_mode)
+        if ok:
+            return
+        chat_id = q.message.chat.id
+        old_id = st.get("msg_id")
+        sent = await q.message.answer(text, reply_markup=kb, parse_mode=parse_mode)
+        st["msg_id"] = sent.message_id
+        UI[chat_id] = st
+        bot_logger.info(
+            "update_ui_from_callback: replaced ui message",
+            extra={"chat_id": chat_id, "old_message_id": old_id, "message_id": st["msg_id"]},
+        )
+        if old_id and old_id != sent.message_id:
+            try:
+                await q.message.bot.delete_message(chat_id, old_id)
+            except TelegramBadRequest as e:
+                bot_logger.debug(
+                    "update_ui_from_callback: delete failed",
+                    extra={"chat_id": chat_id, "message_id": old_id, "error": str(e)},
+                )
+            except Exception:
+                bot_logger.debug(
+                    "update_ui_from_callback: unexpected delete error",
+                    extra={"chat_id": chat_id, "message_id": old_id},
+                )
 
     @DP.message(Command("start"))
     @only_owner
+    @bot_action("command:/start")
     async def h_start(m: types.Message):
-        msg_id, st = await ensure_ui_message(m)
+        _, st = await ensure_ui_message(m)
         st["selected"] = None
         await edit_ui(m.bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
     @DP.message(Command("nodes"))
     @only_owner
+    @bot_action("command:/nodes")
     async def h_nodes(m: types.Message):
-        msg_id, st = await ensure_ui_message(m)
+        _, st = await ensure_ui_message(m)
         st["selected"] = None
         await edit_ui(m.bot, m.chat.id, st, "Выберите сервер:", build_nodes_page(st["page"]))
 
     # --- обработка всех кнопок ---
+    @DP.callback_query(F.data == "noop")
+    @only_owner
+    @bot_action("callback:noop")
+    async def cb_noop(q: types.CallbackQuery):
+        await q.answer()
+
     @DP.callback_query(F.data.startswith("page:"))
     @only_owner
+    @bot_action("callback:page")
     async def cb_page(q: types.CallbackQuery):
-        page = int(q.data.split(":")[1])
-        st = UI.get(q.message.chat.id, {"msg_id": q.message.message_id, "page": 0, "selected": None})
+        if not q.message:
+            await q.answer()
+            return
+        try:
+            page = int(q.data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            bot_logger.warning("failed to parse page", extra={"data": q.data})
+            await q.answer("Ошибка страницы", show_alert=True)
+            return
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
         st["page"] = page
-        UI[q.message.chat.id] = st
-        await safe_edit(q.message,"Выберите сервер:", reply_markup=build_nodes_page(page))
+        st["selected"] = None
+        UI[chat_id] = st
+        await update_ui_from_callback(q, st, "Выберите сервер:", build_nodes_page(page))
         await q.answer()
 
     @DP.callback_query(F.data.startswith("server:"))
     @only_owner
+    @bot_action("callback:server")
     async def cb_server(q: types.CallbackQuery):
-        name = q.data.split(":")[1]
-        st = UI.get(q.message.chat.id, {"msg_id": q.message.message_id, "page": 0, "selected": None})
+        if not q.message:
+            await q.answer()
+            return
+        try:
+            name = q.data.split(":", 1)[1]
+        except IndexError:
+            await q.answer("Ошибка выбора", show_alert=True)
+            return
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
         st["selected"] = name
-        UI[q.message.chat.id] = st
-        # Статус/роль
-        p = next((x for x in peers_with_status() if x.get("name") == name), None)
-        if not p or p.get("status") != "alive":
-            await safe_edit(q.message, f"Сервер *{name}*: Offline", parse_mode="Markdown",
-                                      reply_markup=build_server_menu(name))
+        UI[chat_id] = st
+        peer, _ = resolve_target(name)
+        alive = (peer or {}).get("status") == "alive"
+        if not alive:
+            text = f"Сервер *{name}*: Offline"
         else:
-            is_host = (current_leader().get("node_id") == p.get("node_id"))
+            is_host = (current_leader().get("node_id") == peer.get("node_id")) if peer else False
             tag = " — *Хост*" if is_host else ""
-            await safe_edit(q.message, f"Сервер *{name}*{tag}", parse_mode="Markdown",
-                                      reply_markup=build_server_menu(name))
+            text = f"Сервер *{name}*{tag}"
+        await update_ui_from_callback(q, st, text, build_server_menu(name), parse_mode="Markdown")
         await q.answer()
 
-    @DP.callback_query(F.data == "action:stats")
+    @DP.callback_query(F.data.startswith("action:stats:"))
     @only_owner
+    @bot_action("callback:stats")
     async def cb_stats(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
         target = st.get("selected")
+        UI[chat_id] = st
         if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True);
+            await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        addr = None
-        for p in state.get("peers", []) + [self_peer]:
-            if p.get("name") == target:
-                addr = p.get("addr");
-                break
-        if target == SERVER_NAME: addr = LISTEN_ADDR
+        peer, addr = resolve_target(target)
         if not addr:
-            await q.answer("Сервер не найден", show_alert=True);
+            bot_logger.warning("stats: address missing", extra={"server": target})
+            await q.answer("Сервер не найден", show_alert=True)
             return
+        rpc_logger.info("RPC GetStats request", extra={"server": target, "addr": addr})
+        started = time.time()
         res = await call_rpc(addr, "GetStats", {"target": target})
-        if not res.get("ok"):
-            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
-            return
-        s = res["stats"]
-        text = (f"*{s['server_name']}*\n"
-                f"Uptime: {s['uptime_s']}s\n"
-                f"CPU: {', '.join(str(x) + '%' for x in s['cpu_per_core_pct'])}\n"
-                f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
-                f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
-        await safe_edit(q.message, text, parse_mode="Markdown", reply_markup=build_server_menu(target))
-        await q.answer()
-
-    @DP.callback_query(F.data == "action:reboot")
-    @only_owner
-    async def cb_reboot_ask(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
-        target = st.get("selected")
-        await safe_edit(q.message, f"Перезагрузить *{target}*?", parse_mode="Markdown",
-                                  reply_markup=build_reboot_confirm())
-        await q.answer()
-
-    @DP.callback_query(F.data == "action:reboot_back")
-    @only_owner
-    async def cb_reboot_back(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
-        target = st.get("selected")
-        await safe_edit(q.message, f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
-        await q.answer()
-
-    @DP.callback_query(F.data == "action:reboot_yes")
-    @only_owner
-    async def cb_reboot_yes(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
-        target = st.get("selected")
-        addr = None
-        for p in state.get("peers", []) + [self_peer]:
-            if p.get("name") == target:
-                addr = p.get("addr");
-                break
-        if target == SERVER_NAME: addr = LISTEN_ADDR
-        if not addr:
-            await q.answer("Сервер не найден", show_alert=True);
-            return
-        res = await call_rpc(addr, "Reboot", {"target": target})
-        if not res.get("ok"):
-            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
-            return
-        await safe_edit(q.message, f"Отправлена команда перезагрузки *{target}*…", parse_mode="Markdown",
-                                  reply_markup=build_server_menu(target))
-        await q.answer("Перезагрузка запрошена")
-
-    @DP.callback_query(F.data == "action:net")
-    @only_owner
-    async def cb_net(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
-        target = st.get("selected")
-        if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True);
-            return
-        await safe_edit(q.message, f"Сервер *{target}*\nВыполняю спидтест…", parse_mode="Markdown",
-                                  reply_markup=build_server_menu(target))
-        addr = None
-        for p in state.get("peers", []) + [self_peer]:
-            if p.get("name") == target:
-                addr = p.get("addr");
-                break
-        if target == SERVER_NAME: addr = LISTEN_ADDR
-        if not addr:
-            await q.answer("Сервер не найден", show_alert=True);
-            return
-        res = await rpc_speedtest(addr)
-        if not res.get("ok"):
-            await safe_edit(q.message, f"Сервер *{target}*\nОшибка спидтеста: {res.get('error')}", parse_mode="Markdown",
-                                      reply_markup=build_server_menu(target))
-        else:
-            await safe_edit(
-                q.message, f"Сервер *{target}*\n↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms",
-                parse_mode="Markdown",
-                reply_markup=build_server_menu(target)
+        duration_ms = int((time.time() - started) * 1000)
+        if res.get("ok"):
+            rpc_logger.info(
+                "RPC GetStats ok",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms},
             )
+            s = res["stats"]
+            text = (f"*{s['server_name']}*\n"
+                    f"Uptime: {s['uptime_s']}s\n"
+                    f"CPU: {', '.join(str(x) + '%' for x in s['cpu_per_core_pct'])}\n"
+                    f"RAM: {s['ram']['used_mb']}/{s['ram']['total_mb']} MB ({s['ram']['pct']}%)\n"
+                    f"Disk /: {s['disk_root']['used_gb']}/{s['disk_root']['total_gb']} GB ({s['disk_root']['pct']}%)")
+            await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
+            await q.answer()
+        else:
+            err = res.get("error")
+            rpc_logger.error(
+                "RPC GetStats failed",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                f"Сервер *{target}*\nОшибка получения статуса: {err}",
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer(f"Ошибка: {err}", show_alert=True)
+
+    @DP.callback_query(F.data.startswith("action:reboot:"))
+    @only_owner
+    @bot_action("callback:reboot_confirm")
+    async def cb_reboot_ask(q: types.CallbackQuery):
+        if not q.message:
+            await q.answer()
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
+        target = st.get("selected")
+        UI[chat_id] = st
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        await update_ui_from_callback(q, st, f"Перезагрузить *{target}*?", build_reboot_confirm(target), parse_mode="Markdown")
         await q.answer()
 
-    @DP.callback_query(F.data == "action:graphs")
+    @DP.callback_query(F.data.startswith("action:reboot_back:"))
     @only_owner
+    @bot_action("callback:reboot_back")
+    async def cb_reboot_back(q: types.CallbackQuery):
+        if not q.message:
+            await q.answer()
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
+        target = st.get("selected")
+        UI[chat_id] = st
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        await update_ui_from_callback(q, st, f"Сервер *{target}*", build_server_menu(target), parse_mode="Markdown")
+        await q.answer()
+
+    @DP.callback_query(F.data.startswith("action:reboot_yes:"))
+    @only_owner
+    @bot_action("callback:reboot_yes")
+    async def cb_reboot_yes(q: types.CallbackQuery):
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
+        target = st.get("selected")
+        UI[chat_id] = st
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        peer, addr = resolve_target(target)
+        if not addr:
+            bot_logger.warning("reboot: address missing", extra={"server": target})
+            await q.answer("Сервер не найден", show_alert=True)
+            return
+        rpc_logger.info("RPC Reboot request", extra={"server": target, "addr": addr})
+        started = time.time()
+        res = await call_rpc(addr, "Reboot", {"target": target})
+        duration_ms = int((time.time() - started) * 1000)
+        if res.get("ok"):
+            rpc_logger.info(
+                "RPC Reboot ok",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                f"Отправлена команда перезагрузки *{target}*…",
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer("Перезагрузка запрошена")
+        else:
+            err = res.get("error")
+            rpc_logger.error(
+                "RPC Reboot failed",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                f"Сервер *{target}*\nОшибка перезагрузки: {err}",
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer(f"Ошибка: {err}", show_alert=True)
+
+    @DP.callback_query(F.data.startswith("action:net:"))
+    @only_owner
+    @bot_action("callback:net")
+    async def cb_net(q: types.CallbackQuery):
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
+        target = st.get("selected")
+        UI[chat_id] = st
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        await update_ui_from_callback(
+            q,
+            st,
+            f"Сервер *{target}*\nВыполняю спидтест…",
+            build_server_menu(target),
+            parse_mode="Markdown",
+        )
+        peer, addr = resolve_target(target)
+        if not addr:
+            bot_logger.warning("speedtest: address missing", extra={"server": target})
+            await q.answer("Сервер не найден", show_alert=True)
+            return
+        rpc_logger.info("RPC RunSpeedtest request", extra={"server": target, "addr": addr})
+        started = time.time()
+        res = await rpc_speedtest(addr)
+        duration_ms = int((time.time() - started) * 1000)
+        if res.get("ok"):
+            rpc_logger.info(
+                "RPC RunSpeedtest ok",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "down": res.get("down_mbps"), "up": res.get("up_mbps"), "ping": res.get("ping_ms")},
+            )
+            text = (
+                f"Сервер *{target}*\n"
+                f"↓ {res['down_mbps']} Mbit/s • ↑ {res['up_mbps']} Mbit/s • ping {res['ping_ms']} ms"
+            )
+            await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
+            await q.answer("Готово")
+        else:
+            err = res.get("error")
+            rpc_logger.error(
+                "RPC RunSpeedtest failed",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+            )
+            await update_ui_from_callback(
+                q,
+                st,
+                f"Сервер *{target}*\nОшибка спидтеста: {err}",
+                build_server_menu(target),
+                parse_mode="Markdown",
+            )
+            await q.answer(f"Ошибка: {err}", show_alert=True)
+
+    @DP.callback_query(F.data.startswith("action:graphs:"))
+    @only_owner
+    @bot_action("callback:graphs_menu")
     async def cb_graphs_menu(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
         target = st.get("selected")
+        UI[chat_id] = st
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        await safe_edit(q.message, f"Сервер *{target}* — раздел графиков", parse_mode="Markdown",
-                        reply_markup=build_graph_menu())
+        await update_ui_from_callback(
+            q,
+            st,
+            f"Сервер *{target}* — раздел графиков",
+            build_graph_menu(target),
+            parse_mode="Markdown",
+        )
         await q.answer()
 
-    @DP.callback_query(F.data == "graph:cpu")
+    @DP.callback_query(F.data.startswith("graph:cpu:"))
     @only_owner
+    @bot_action("callback:graph_cpu")
     async def cb_graph_cpu(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
         target = st.get("selected")
+        UI[chat_id] = st
         if not target:
             await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        addr = None
-        for p in state.get("peers", []) + [self_peer]:
-            if p.get("name") == target:
-                addr = p.get("addr")
-                break
-        if target == SERVER_NAME:
-            addr = LISTEN_ADDR
-
-        res = await rpc_get_ts(addr, "cpu", hours=6)
-        if not res.get("ok"):
-            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True)
+        peer, addr = resolve_target(target)
+        if not addr:
+            bot_logger.warning("graph cpu: address missing", extra={"server": target})
+            await q.answer("Сервер не найден", show_alert=True)
             return
-
+        rpc_logger.info("RPC GetTS(cpu) request", extra={"server": target, "addr": addr})
+        started = time.time()
+        res = await rpc_get_ts(addr, "cpu", hours=6)
+        duration_ms = int((time.time() - started) * 1000)
+        if not res.get("ok"):
+            err = res.get("error")
+            rpc_logger.error(
+                "RPC GetTS(cpu) failed",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+            )
+            await q.answer(f"Ошибка: {err}", show_alert=True)
+            return
+        rpc_logger.info(
+            "RPC GetTS(cpu) ok",
+            extra={"server": target, "addr": addr, "duration_ms": duration_ms, "points": len(res.get("series", []))},
+        )
         img_bytes = render_timeseries_png(f"CPU — {target} (6h)", res["series"], "CPU %")
+        bot_logger.info("graph cpu generated", extra={"server": target, "bytes": len(img_bytes)})
         img = BufferedInputFile(img_bytes, filename="cpu.png")
         await q.message.answer_photo(img)
-        await q.answer()
+        bot_logger.info("graph cpu sent", extra={"server": target})
+        await q.answer("График отправлен")
 
-    @DP.callback_query(F.data == "graph:net")
+    @DP.callback_query(F.data.startswith("graph:net:"))
     @only_owner
+    @bot_action("callback:graph_net")
     async def cb_graph_net(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
+        if not q.message:
+            await q.answer("Нет сообщения", show_alert=True)
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
         target = st.get("selected")
+        UI[chat_id] = st
         if not target:
-            await q.answer("Сначала выберите сервер", show_alert=True);
+            await q.answer("Сначала выберите сервер", show_alert=True)
             return
-        addr = None
-        for p in state.get("peers", []) + [self_peer]:
-            if p.get("name") == target:
-                addr = p.get("addr");
-                break
-        if target == SERVER_NAME: addr = LISTEN_ADDR
+        peer, addr = resolve_target(target)
+        if not addr:
+            bot_logger.warning("graph net: address missing", extra={"server": target})
+            await q.answer("Сервер не найден", show_alert=True)
+            return
+        rpc_logger.info("RPC GetTS(net) request", extra={"server": target, "addr": addr})
+        started = time.time()
         res = await rpc_get_ts(addr, "net", hours=6)
+        duration_ms = int((time.time() - started) * 1000)
         if not res.get("ok"):
-            await q.answer(f"Ошибка: {res.get('error')}", show_alert=True);
+            err = res.get("error")
+            rpc_logger.error(
+                "RPC GetTS(net) failed",
+                extra={"server": target, "addr": addr, "duration_ms": duration_ms, "error": err},
+            )
+            await q.answer(f"Ошибка: {err}", show_alert=True)
             return
-        # рисуем две линии — down/up
+        rpc_logger.info(
+            "RPC GetTS(net) ok",
+            extra={"server": target, "addr": addr, "duration_ms": duration_ms, "down_points": len(res.get("down", [])), "up_points": len(res.get("up", []))},
+        )
         down = res.get("down", [])
         up = res.get("up", [])
-        # объединённый график
-        # сделаем две оси на одном полотне ради читаемости
         plt.figure(figsize=(10, 4), dpi=160)
         if down:
             plt.plot([x for x, _ in down], [y for _, y in down], linewidth=2, label="↓ Mbit/s")
@@ -1146,32 +1514,54 @@ async def start_bot():
         plt.legend()
         buf = io.BytesIO()
         plt.tight_layout()
-        plt.savefig(buf, format="png");
-        plt.close();
+        plt.savefig(buf, format="png")
+        plt.close()
         buf.seek(0)
-        img = BufferedInputFile(buf.getvalue(), filename="graph.png")
+        data = buf.getvalue()
+        bot_logger.info("graph net generated", extra={"server": target, "bytes": len(data)})
+        img = BufferedInputFile(data, filename="network.png")
         await q.message.answer_photo(img)
-        await q.answer()
+        bot_logger.info("graph net sent", extra={"server": target})
+        await q.answer("График отправлен")
 
     @DP.callback_query(F.data == "back:nodes")
     @only_owner
+    @bot_action("callback:back_nodes")
     async def cb_back_nodes(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {"page": 0, "selected": None})
+        if not q.message:
+            await q.answer()
+            return
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
         st["selected"] = None
-        UI[q.message.chat.id] = st
-        await safe_edit(q.message, "Выберите сервер:", reply_markup=build_nodes_page(st["page"]))
+        UI[chat_id] = st
+        await update_ui_from_callback(q, st, "Выберите сервер:", build_nodes_page(st["page"]))
         await q.answer()
 
-    @DP.callback_query(F.data == "back:server")
+    @DP.callback_query(F.data.startswith("back:server:"))
     @only_owner
+    @bot_action("callback:back_server")
     async def cb_back_server(q: types.CallbackQuery):
-        st = UI.get(q.message.chat.id, {})
+        if not q.message:
+            await q.answer()
+            return
+        parts = q.data.split(":", 2)
+        target = parts[2] if len(parts) > 2 else ""
+        chat_id = q.message.chat.id
+        st = ensure_ui(chat_id)
+        if target:
+            st["selected"] = target
         target = st.get("selected")
-        await safe_edit(q.message, f"Сервер *{target}*", parse_mode="Markdown", reply_markup=build_server_menu(target))
+        UI[chat_id] = st
+        if not target:
+            await q.answer("Сначала выберите сервер", show_alert=True)
+            return
+        await update_ui_from_callback(q, st, f"Сервер *{target}*", build_server_menu(target), parse_mode="Markdown")
         await q.answer()
 
     @DP.message(Command("invite"))
     @only_owner
+    @bot_action("command:/invite")
     async def cmd_invite(m: types.Message):
         parts = m.text.strip().split(maxsplit=1)
         ttl_s = 900
@@ -1188,6 +1578,7 @@ async def start_bot():
         tokens.append({"token": tok, "exp_ts": now_s() + ttl_s})
         invites["tokens"] = tokens
         save_json(INVITES_FILE, invites)
+        bot_logger.info("invite generated", extra={"ttl_s": ttl_s, "token_prefix": tok[:6]})
         host = PUBLIC_ADDR or LISTEN_ADDR
         link = f"join://{host}?net={state.get('network_id')}&token={tok}&ttl={ttl_s}s"
         await m.reply(f"Join link (valid {ttl_s}s):\n`{link}`", parse_mode="Markdown")
