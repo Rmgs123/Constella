@@ -8,11 +8,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import signal
+import socket
 import sys
 import time
 import uuid
@@ -34,11 +36,16 @@ INVITES_FILE = os.path.join(STATE_DIR, "invites.json")
 
 SERVER_NAME = os.environ.get("SERVER_NAME", f"node-{uuid.uuid4().hex[:6]}")
 LISTEN_ADDR = os.environ.get("LISTEN_ADDR", "0.0.0.0:4747")
-PUBLIC_ADDR = os.environ.get("PUBLIC_ADDR", None)  # host:port обязательно при init
+_public_addr_env = os.environ.get("PUBLIC_ADDR")
+PUBLIC_ADDR = _public_addr_env.strip() if _public_addr_env and _public_addr_env.strip() else None  # host:port обязательно при init
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")  # @username (устанавливается при init)
 JOIN_URL = os.environ.get("JOIN_URL", "")  # используется при первом старте join
 SEED_PEERS = [p.strip() for p in os.environ.get("SEED_PEERS", "").split(",") if p.strip()]
+
+VPN_MODE = os.environ.get("VPN_MODE", "none").strip().lower()
+VPN_INTERFACE_NAME = os.environ.get("VPN_INTERFACE_NAME", "wg0")
+VPN_CIDR = os.environ.get("VPN_CIDR", "10.42.0.0/24")
 
 SAMPLE_EVERY_SEC = int(os.environ.get("SAMPLE_EVERY_SEC", "300"))  # 5 мин
 METRICS_WINDOW_H = int(os.environ.get("METRICS_WINDOW_H", "6"))    # последние 6 часов
@@ -61,6 +68,80 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("constella")
 bot_logger = logging.getLogger("constella.bot")
 rpc_logger = logging.getLogger("constella.rpc")
+vpn_logger = logging.getLogger("constella.vpn")
+
+
+def _extract_port(addr: str, default: int = 4747) -> int:
+    try:
+        return int(addr.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return default
+
+
+def detect_vpn_ip() -> Optional[str]:
+    """Return VPN overlay IPv4 address when interface is available."""
+
+    try:
+        network = ipaddress.ip_network(VPN_CIDR, strict=False)
+    except ValueError:
+        vpn_logger.error(
+            "VPN overlay enabled but VPN_CIDR is invalid",
+            extra={"cidr": VPN_CIDR},
+        )
+        return None
+
+    interfaces = psutil.net_if_addrs()
+    addrs = interfaces.get(VPN_INTERFACE_NAME)
+    if not addrs:
+        vpn_logger.warning(
+            "VPN overlay enabled but interface missing",
+            extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME},
+        )
+        return None
+
+    for item in addrs:
+        if item.family == socket.AF_INET:
+            try:
+                addr = ipaddress.ip_address(item.address)
+            except ValueError:
+                continue
+            if addr in network:
+                return str(addr)
+
+    vpn_logger.warning(
+        "VPN overlay enabled but no address from CIDR detected",
+        extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME, "cidr": VPN_CIDR},
+    )
+    return None
+
+
+_public_addr_overridden = PUBLIC_ADDR is not None
+VPN_OVERLAY_IP: Optional[str] = None
+
+if VPN_MODE and VPN_MODE != "none":
+    vpn_logger.info(
+        "VPN overlay requested",
+        extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME, "cidr": VPN_CIDR},
+    )
+    VPN_OVERLAY_IP = detect_vpn_ip()
+    if VPN_OVERLAY_IP:
+        if not _public_addr_overridden:
+            port = _extract_port(LISTEN_ADDR)
+            PUBLIC_ADDR = f"{VPN_OVERLAY_IP}:{port}"
+            vpn_logger.info(
+                "VPN overlay active; using interface address as PUBLIC_ADDR",
+                extra={"public_addr": PUBLIC_ADDR},
+            )
+        else:
+            vpn_logger.info(
+                "VPN overlay active but PUBLIC_ADDR provided explicitly",
+                extra={"public_addr": PUBLIC_ADDR},
+            )
+    else:
+        vpn_logger.warning(
+            "VPN overlay requested but interface is not ready; falling back to default addressing",
+            extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME},
+        )
 
 # Тайминги
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "2.0"))
