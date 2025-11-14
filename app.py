@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-import asyncio, json, os, hmac, hashlib, time, uuid, signal, sys, secrets
-from typing import Dict, Any, List, Optional, Tuple
-from functools import wraps
-from aiohttp import web, ClientSession, ClientTimeout
-import psutil
+"""Constella – distributed monitoring & control node."""
+
+# --- Imports & global constants ------------------------------------------------
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
 import logging
-
+import os
+import secrets
+import signal
+import sys
+import time
+import uuid
 from collections import deque
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
+from aiohttp import ClientSession, ClientTimeout, web
 from aiogram.exceptions import TelegramBadRequest
 
-# Зарефакторить код
+# --- Configuration from environment ------------------------------------------------
 
-# ИСПРАВИТЬ БАГ С ПОСТОЯННОЙ ПОПЫТКОЙ КАЖДОГО УЗЛА НАЧАТЬ ПОЛЛИНГ!
-# @mvln и @ELBruno
-
-# ----------------------------
-# Конфиг / состояние
-# ----------------------------
 APP_NAME = "Constella"
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 os.makedirs(STATE_DIR, exist_ok=True)
@@ -67,10 +75,15 @@ CLOCK_SKEW = int(os.environ.get("CLOCK_SKEW", "15"))  # сек, допускае
 
 LEADER_GRACE_SEC = float(os.environ.get("LEADER_GRACE_SEC", str(DOWN_AFTER_MISSES*HEARTBEAT_INTERVAL + 2.0)))
 
+# Lease for Telegram polling is enforced via distributed RPC coordination.
 BOT_LEASE_TTL = int(os.environ.get("BOT_LEASE_TTL", "10"))  # секунд
 
-# Вспомогательные
-def now_s() -> int: return int(time.time())
+
+# --- Persistent storage & local state ---------------------------------------------
+
+def now_s() -> int:
+    return int(time.time())
+
 
 def load_json(path: str, default):
     try:
@@ -84,6 +97,8 @@ def save_json(path: str, data: Any):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+# --- Metrics & telemetry helpers --------------------------------------------------
 
 def _run_speedtest_blocking() -> Dict[str, Any]:
     try:
@@ -117,20 +132,21 @@ def _filter_last_hours(samples: deque, hours: int) -> list[tuple[int, float]]:
     cutoff = now_s() - hours * 3600
     return [(ts, v) for ts, v in samples if ts >= cutoff]
 
+
 async def telemetry_loop():
-    # Первичный быстрый замер CPU, потом каждые SAMPLE_EVERY_SEC
+    """Collects periodic CPU and optional speedtest metrics in the background."""
+
+    # Fast initial snapshot so the UI has data immediately after startup.
     CPU_SAMPLES.append((now_s(), psutil.cpu_percent(interval=0.2)))
     if ENABLE_BG_SPEEDTEST:
-        # не блокируем первый цикл, просто отметим нули — живые значения появятся при первом /network или плановом прогоне
+        # Do not block startup; placeholders will be replaced by the first real run.
         NET_DOWN_SAMPLES.append((now_s(), 0.0))
         NET_UP_SAMPLES.append((now_s(), 0.0))
 
     while True:
         ts = now_s()
-        # CPU
         CPU_SAMPLES.append((ts, psutil.cpu_percent(interval=0.2)))
 
-        # Network speed (раз в SAMPLE_EVERY_SEC, но защищаемся от параллельного прогона)
         if ENABLE_BG_SPEEDTEST and not SPEEDTEST_LOCK.locked():
             async with SPEEDTEST_LOCK:
                 res = await run_local_speedtest()
@@ -139,17 +155,67 @@ async def telemetry_loop():
                 NET_DOWN_SAMPLES.append((ts_now, float(res["down_mbps"])))
                 NET_UP_SAMPLES.append((ts_now, float(res["up_mbps"])))
                 logger.debug(
-                    "background speedtest ok",
-                    extra={"down": res.get("down_mbps"), "up": res.get("up_mbps"), "ping": res.get("ping_ms")},
+                    "[telemetry] background speedtest ok",
+                    extra={
+                        "down": res.get("down_mbps"),
+                        "up": res.get("up_mbps"),
+                        "ping": res.get("ping_ms"),
+                    },
                 )
             else:
                 logger.warning(
-                    "background speedtest failed",
+                    "[telemetry] background speedtest failed",
                     extra={"error": res.get("error")},
                 )
         await asyncio.sleep(SAMPLE_EVERY_SEC)
 
-# Сетевое общее состояние (кэш на узле)
+
+def summarize_series_points(
+    series: List[Tuple[int, Any]],
+    limit: int = METRICS_SUMMARY_POINTS,
+) -> Tuple[int, float, float]:
+    if not series:
+        return 0, 0.0, 0.0
+    ordered = sorted(series, key=lambda x: x[0])
+    trimmed = ordered[-max(1, limit):]
+    values = [float(v) for _, v in trimmed]
+    avg = sum(values) / len(values)
+    max_v = max(values)
+    return len(trimmed), avg, max_v
+
+
+def summarize_net_points(
+    down: List[Tuple[int, Any]],
+    up: List[Tuple[int, Any]],
+    limit: int = METRICS_SUMMARY_POINTS,
+) -> Tuple[int, float, float]:
+    down_ordered = sorted(down, key=lambda x: x[0]) if down else []
+    up_ordered = sorted(up, key=lambda x: x[0]) if up else []
+    down_trim = down_ordered[-max(1, limit):] if down_ordered else []
+    up_trim = up_ordered[-max(1, limit):] if up_ordered else []
+    avg_down = sum(float(v) for _, v in down_trim) / len(down_trim) if down_trim else 0.0
+    avg_up = sum(float(v) for _, v in up_trim) / len(up_trim) if up_trim else 0.0
+    count = max(len(down_trim), len(up_trim))
+    return count, avg_down, avg_up
+
+
+def sample_window_label(count: int, singular: str, plural: str) -> str:
+    if count == 1:
+        return f"последнее {singular}"
+    return f"последние {count} {plural}"
+
+
+def friendly_error_message(err: Optional[str]) -> str:
+    if not err:
+        return "неизвестная ошибка"
+    text = str(err)
+    if text.startswith("rpc_error:"):
+        text = text.split("rpc_error:", 1)[1]
+    if "timeout" in text.lower():
+        return "таймаут запроса"
+    return text
+
+# Local persistent cache with network topology & bot lease info
 state = load_json(STATE_FILE, {
     "network_id": NETWORK_ID or "",
     "owner_username": OWNER_USERNAME or "",
@@ -158,6 +224,7 @@ state = load_json(STATE_FILE, {
     "bot_lease": {"owner": "", "until": 0}
 })
 
+# Outstanding invite tokens (for onboarding new peers)
 invites = load_json(INVITES_FILE, {
     "tokens": []  # [{token, exp_ts}]
 })
@@ -172,7 +239,7 @@ else:
     with open(NODE_ID_FILE, "w") as f:
         f.write(NODE_ID)
 
-# Локальная таблица пиров: node_id -> peer
+# In-memory peer table keeps the freshest view for fast lookups
 peers: Dict[str, Dict[str, Any]] = {}
 self_peer = {"name": SERVER_NAME, "addr": PUBLIC_ADDR, "node_id": NODE_ID, "status": "alive", "last_seen": now_s()}
 
@@ -186,9 +253,7 @@ BOT_RUNNING_OWNER: Optional[str] = None
 BOT_LAST_BROADCAST_UNTIL = 0
 BOT_LAST_BROADCAST_OWNER: Optional[str] = None
 
-# ----------------------------
-# Подпись RPC (HMAC)
-# ----------------------------
+# --- RPC payload signing ---------------------------------------------------------
 def canonical_json(d: Dict[str, Any]) -> str:
     return json.dumps(d, separators=(",", ":"), sort_keys=True)
 
@@ -207,6 +272,9 @@ def verify_sig(payload: Dict[str, Any], secret: str) -> bool:
     calc = make_sig(payload, secret)
     return hmac.compare_digest(calc, sig)
 
+
+# --- Bot lease helpers -----------------------------------------------------------
+
 def set_bot_lease(owner: str, until: int):
     state["bot_lease"] = {"owner": owner, "until": until}
     save_json(STATE_FILE, state)
@@ -215,9 +283,7 @@ def get_bot_lease():
     bl = state.get("bot_lease", {}) or {}
     return bl.get("owner",""), int(bl.get("until",0))
 
-# ----------------------------
-# Вспомогательные оперции с peer-list
-# ----------------------------
+# --- Peer table helpers ----------------------------------------------------------
 def set_state(k: str, v: Any):
     state[k] = v
     save_json(STATE_FILE, state)
@@ -255,7 +321,7 @@ def get_alive_peers() -> List[Dict[str, Any]]:
     alive = []
     now = now_s()
     for p in [*peers.values(), self_peer]:
-        status = "alive" if is_peer_online(p.get("last_seen"), now=now) else "offline"
+        status = peer_status(p, now=now)
         p["status"] = status
         if status == "alive":
             alive.append(p)
@@ -324,9 +390,7 @@ async def safe_edit_message(bot, chat_id: int, message_id: int, text: str, *, re
         bot_logger.exception("safe_edit_message: unexpected exception", extra={"chat_id": chat_id, "message_id": message_id})
         raise
 
-# ----------------------------
-# Метрики
-# ----------------------------
+# --- Metrics snapshot helpers ----------------------------------------------------
 def collect_stats() -> Dict[str, Any]:
     cpu = psutil.cpu_percent(interval=0.2, percpu=True)
     vm = psutil.virtual_memory()
@@ -339,9 +403,7 @@ def collect_stats() -> Dict[str, Any]:
         "disk_root": {"total_gb": round(du.total / (1024**3),1), "used_gb": round(du.used / (1024**3),1), "pct": round(du.percent,2)},
     }
 
-# ----------------------------
-# HTTP сервер (RPC)
-# ----------------------------
+# --- HTTP server & RPC endpoints -------------------------------------------------
 routes = web.RouteTableDef()
 http_client: Optional[ClientSession] = None
 HTTP_CLIENT_LOCK = asyncio.Lock()
@@ -632,6 +694,24 @@ async def rpc(req):
     else:
         return web.json_response({"ok": False, "error": "unknown method"}, status=400)
 
+
+# --- RPC client helpers ----------------------------------------------------------
+
+async def call_rpc(addr: str, method: str, params: Dict[str, Any], *, timeout: Optional[float] = None) -> Dict[str, Any]:
+    if not state.get("network_secret"):
+        return {"ok": False, "error": "no_network_secret"}
+    payload = {"method": method, "params": params, "ts": now_s()}
+    payload["sig"] = make_sig(payload, state["network_secret"])
+    url = f"http://{addr}/rpc"
+    client = await ensure_http_client()
+    try:
+        total = timeout if timeout is not None else RPC_TIMEOUT
+        async with client.post(url, json=payload, timeout=ClientTimeout(total=total)) as r:
+            return await r.json()
+    except Exception as e:
+        return {"ok": False, "error": f"rpc_error:{e}"}
+
+
 async def get_lease(addr: str):
     return await call_rpc(addr, "GetLease", {})
 
@@ -652,6 +732,9 @@ async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
 
 async def bot_takeover(addr: str, owner: str, until: int) -> Dict[str, Any]:
     return await call_rpc(addr, "Bot.Takeover", {"owner": owner, "until": until})
+
+
+# --- Lease coordination & leader election ----------------------------------------
 
 async def propagate_bot_lease(owner: str, until: int, *, force_takeover: bool = False):
     """Update local lease view and notify peers only when ownership changes.
@@ -722,26 +805,7 @@ async def async_reboot():
     os.system("sync")
     os.system(cmd)
 
-# ----------------------------
-# Клиентские вызовы (RPC)
-# ----------------------------
-async def call_rpc(addr: str, method: str, params: Dict[str, Any], *, timeout: Optional[float] = None) -> Dict[str, Any]:
-    if not state.get("network_secret"):
-        return {"ok": False, "error": "no_network_secret"}
-    payload = {"method": method, "params": params, "ts": now_s()}
-    payload["sig"] = make_sig(payload, state["network_secret"])
-    url = f"http://{addr}/rpc"
-    client = await ensure_http_client()
-    try:
-        total = timeout if timeout is not None else RPC_TIMEOUT
-        async with client.post(url, json=payload, timeout=ClientTimeout(total=total)) as r:
-            return await r.json()
-    except Exception as e:
-        return {"ok": False, "error": f"rpc_error:{e}"}
-
-# ----------------------------
-# Heartbeat / Discovery
-# ----------------------------
+# --- Heartbeat & peer discovery --------------------------------------------------
 async def heartbeat_loop():
     await asyncio.sleep(0.1)
     # первичное заполнение peers из state (если было)
@@ -801,6 +865,17 @@ def peer_status(p: Optional[Dict[str, Any]], *, now: Optional[int] = None) -> st
         now = now_s()
     return "alive" if is_peer_online(last_seen, now=now) else "offline"
 
+
+STATUS_EMOJI = {
+    "alive": "🟢",
+    "offline": "🔴",
+}
+
+
+def peer_status_icon(status: str) -> str:
+    return STATUS_EMOJI.get(status, "⚪️")
+
+
 def peers_with_status() -> List[Dict[str, Any]]:
     # объединяем известных пиров и себя; статусы считаем на лету
     merged = {p.get("node_id", ""): dict(p) for p in state.get("peers", [])}
@@ -813,12 +888,11 @@ def peers_with_status() -> List[Dict[str, Any]]:
         name = q.get("name") or q.get("addr") or (q.get("node_id") or "")[:8] or "?"
         q["name"] = name
         q["status"] = peer_status(q, now=now)
+        q["status_emoji"] = peer_status_icon(q["status"])
         out.append(q)
     return out
 
-# ----------------------------
-# JOIN (если узел впервые стартует с JOIN_URL)
-# ----------------------------
+# --- Network bootstrap (JOIN flow) -----------------------------------------------
 def parse_join_url(u: str) -> Tuple[str, Dict[str, str]]:
     # join://host:port?net=...&token=...&ttl=...
     assert u.startswith("join://")
@@ -887,9 +961,7 @@ async def do_join_if_needed():
     print(f"[join] Joined network {data['network_id']} via {seed}")
 
 
-# ----------------------------
-# Telegram бот (aiogram v3)
-# ----------------------------
+# --- Telegram bot orchestration --------------------------------------------------
 
 def normalized_owner() -> str:
     u = state.get("owner_username","").strip()
@@ -899,6 +971,7 @@ def bot_task_running() -> bool:
     return BOT_TASK is not None and not BOT_TASK.done()
 
 async def start_bot():
+    """Start the aiogram polling loop once we are the lease holder."""
     global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER
 
     async with BOT_LOCK:
@@ -913,7 +986,7 @@ async def start_bot():
         from aiogram.filters import Command
         from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-        # --- простое состояние UI на 1 владельца ---
+        # --- Inline UI state & helpers (single owner) ---
         UI = {}  # chat_id -> {"msg_id": int, "page": int, "selected": Optional[str]}
 
         PAGE_SIZE = 6
@@ -969,14 +1042,14 @@ async def start_bot():
                 chat_id = event_chat_id(event)
                 data = getattr(event, "data", None)
                 bot_logger.info(
-                    f"action {action_name}",
+                    f"[bot] action {action_name}",
                     extra={"chat_id": chat_id, "data": data, "user": describe_user(event)},
                 )
                 try:
                     return await func(event, *a, **k)
                 except Exception as e:
                     bot_logger.exception(
-                        f"action {action_name} failed",
+                        f"[bot] action {action_name} failed",
                         extra={"chat_id": chat_id, "data": data, "user": describe_user(event)},
                     )
                     if isinstance(event, types.CallbackQuery):
@@ -987,12 +1060,6 @@ async def start_bot():
                     return
             return wrapper
         return decorator
-
-    def peers_with_status():
-        # берём state.peers + self_peer, обновл. статус уже делает heartbeat_loop
-        d = {p.get("node_id", ""): p for p in state.get("peers", [])}
-        d[NODE_ID] = self_peer
-        return list(d.values())
 
     def ensure_ui(chat_id: int) -> dict:
         st = UI.get(chat_id)
@@ -1043,39 +1110,7 @@ async def start_bot():
             peer["status"] = status
         return title, peer, addr, status, is_host
 
-    def summarize_series_points(series: List[Tuple[int, Any]], limit: int = METRICS_SUMMARY_POINTS) -> Tuple[int, float, float]:
-        if not series:
-            return 0, 0.0, 0.0
-        ordered = sorted(series, key=lambda x: x[0])
-        trimmed = ordered[-max(1, limit):]
-        values = [float(v) for _, v in trimmed]
-        avg = sum(values) / len(values)
-        max_v = max(values)
-        return len(trimmed), avg, max_v
-
-    def summarize_net_points(
-        down: List[Tuple[int, Any]],
-        up: List[Tuple[int, Any]],
-        limit: int = METRICS_SUMMARY_POINTS,
-    ) -> Tuple[int, float, float]:
-        down_ordered = sorted(down, key=lambda x: x[0]) if down else []
-        up_ordered = sorted(up, key=lambda x: x[0]) if up else []
-        down_trim = down_ordered[-max(1, limit):] if down_ordered else []
-        up_trim = up_ordered[-max(1, limit):] if up_ordered else []
-        avg_down = sum(float(v) for _, v in down_trim) / len(down_trim) if down_trim else 0.0
-        avg_up = sum(float(v) for _, v in up_trim) / len(up_trim) if up_trim else 0.0
-        count = max(len(down_trim), len(up_trim))
-        return count, avg_down, avg_up
-
-    def friendly_error_message(err: Optional[str]) -> str:
-        if not err:
-            return "неизвестная ошибка"
-        text = str(err)
-        if text.startswith("rpc_error:"):
-            text = text.split("rpc_error:", 1)[1]
-        if "timeout" in text.lower():
-            return "таймаут запроса"
-        return text
+    # Inline keyboard builders --------------------------------------------------
 
     def build_nodes_page(page: int) -> types.InlineKeyboardMarkup:
         peers = sorted(peers_with_status(), key=lambda p: p.get("name", ""))
@@ -1086,7 +1121,7 @@ async def start_bot():
         for p in chunk:
             name = p.get("name")
             status = (p.get("status") or "").lower()
-            icon = "🟢" if status == "alive" else "🔴"
+            icon = p.get("status_emoji") or peer_status_icon(status)
             kb.button(text=f"{icon} {name}", callback_data=f"server:{name}")
         if chunk:
             kb.adjust(2)
@@ -1605,25 +1640,50 @@ async def start_bot():
                 extra={"server": target, "addr": addr, "duration_ms": net_duration_ms, "error": net_res.get("error")},
             )
 
-        cpu_line: str
         if cpu_res.get("ok"):
-            count, avg_cpu, max_cpu = summarize_series_points(cpu_res.get("series", []))
-            if count:
-                cpu_line = f"CPU (посл. {count}): ср. {avg_cpu:.1f}% • макс {max_cpu:.1f}%"
+            cpu_count, avg_cpu, max_cpu = summarize_series_points(cpu_res.get("series", []))
+            if cpu_count:
+                window = sample_window_label(cpu_count, "измерение", "измерений")
+                cpu_line = (
+                    f"CPU recent samples ({window}): среднее {avg_cpu:.1f}% • максимум {max_cpu:.1f}%."
+                )
             else:
-                cpu_line = "CPU: данных нет"
+                cpu_line = "CPU: исторические данные отсутствуют."
         else:
             cpu_line = f"CPU: ошибка {friendly_error_message(cpu_res.get('error'))}"
+            cpu_count = 0
+            avg_cpu = max_cpu = 0.0
 
-        net_line: str
         if net_res.get("ok"):
-            count, avg_down, avg_up = summarize_net_points(net_res.get("down", []), net_res.get("up", []))
-            if count:
-                net_line = f"Сеть (посл. {count}): ср. ↓ {avg_down:.1f} Mbit/s • ср. ↑ {avg_up:.1f} Mbit/s"
+            net_count, avg_down, avg_up = summarize_net_points(
+                net_res.get("down", []),
+                net_res.get("up", []),
+            )
+            if net_count:
+                window = sample_window_label(net_count, "замер", "замеров")
+                net_line = (
+                    f"Сеть — {window} (recent samples): средняя ↓ {avg_down:.1f} Mbit/s • "
+                    f"средняя ↑ {avg_up:.1f} Mbit/s."
+                )
             else:
-                net_line = "Сеть: данных нет"
+                net_line = "Сеть: исторические данные отсутствуют."
         else:
             net_line = f"Сеть: ошибка {friendly_error_message(net_res.get('error'))}"
+            net_count = 0
+            avg_down = avg_up = 0.0
+
+        bot_logger.info(
+            "metrics summary ready",
+            extra={
+                "server": target,
+                "cpu_count": cpu_count,
+                "cpu_avg": round(avg_cpu, 2),
+                "cpu_max": round(max_cpu, 2),
+                "net_count": net_count,
+                "net_avg_down": round(avg_down, 2),
+                "net_avg_up": round(avg_up, 2),
+            },
+        )
 
         text = f"{title}\n\n{cpu_line}\n{net_line}"
         await update_ui_from_callback(q, st, text, build_server_menu(target), parse_mode="Markdown")
@@ -1770,6 +1830,7 @@ async def start_bot():
     BOT_TASK = asyncio.create_task(_run())
 
 async def stop_bot():
+    """Stop polling and clean up bot resources safely."""
     global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER, BOT_LAST_BROADCAST_UNTIL, BOT_LAST_BROADCAST_OWNER
 
     async with BOT_LOCK:
@@ -1817,6 +1878,7 @@ async def stop_bot():
         BOT_LAST_BROADCAST_OWNER = None
 
 async def leader_watcher():
+    """Track leadership status and uphold the Telegram polling lease."""
     was_leader = False
     grace_deadline = 0.0
     while True:
@@ -1945,9 +2007,7 @@ def lease_coordinator_peer() -> Optional[Dict[str, Any]]:
     best = min(alive, key=lambda p: p.get("node_id", ""))
     return best
 
-# ----------------------------
-# HTTP сервер bootstrap
-# ----------------------------
+# --- Application bootstrap -------------------------------------------------------
 def parse_listen(addr: str) -> Tuple[str,int]:
     host, port = addr.split(":")
     return host, int(port)
