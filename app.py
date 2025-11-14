@@ -176,6 +176,7 @@ BOT_RUN_GEN = 0   # глобальный счётчик поколений
 BOT_LOCK = asyncio.Lock()
 BOT_RUNNING_OWNER: Optional[str] = None
 BOT_LAST_BROADCAST_UNTIL = 0
+BOT_LAST_BROADCAST_OWNER: Optional[str] = None
 
 # ----------------------------
 # Подпись RPC (HMAC)
@@ -290,6 +291,16 @@ def collect_stats() -> Dict[str, Any]:
 # ----------------------------
 routes = web.RouteTableDef()
 http_client: Optional[ClientSession] = None
+HTTP_CLIENT_LOCK = asyncio.Lock()
+
+
+async def ensure_http_client() -> ClientSession:
+    """Return a shared aiohttp session, creating it lazily when needed."""
+    global http_client
+    async with HTTP_CLIENT_LOCK:
+        if http_client is None or http_client.closed:
+            http_client = ClientSession()
+        return http_client
 
 @routes.get("/health")
 async def health(req):
@@ -564,11 +575,27 @@ async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
 async def bot_takeover(addr: str, owner: str, until: int) -> Dict[str, Any]:
     return await call_rpc(addr, "Bot.Takeover", {"owner": owner, "until": until})
 
-async def propagate_bot_lease(owner: str, until: int):
-    """Рассылаем информацию о новом владельце бота всем живым узлам."""
-    global BOT_LAST_BROADCAST_UNTIL
+async def propagate_bot_lease(owner: str, until: int, *, force_takeover: bool = False):
+    """Update local lease view and notify peers only when ownership changes.
+
+    Silent renewals keep updating ``state['bot_lease']`` but avoid broadcasting
+    Bot.Takeover RPCs so followers do not spam their logs. When ``owner`` changes
+    (leadership hand-over) or ``force_takeover`` is requested we fan out the
+    takeover notification exactly once.
+    """
+
+    global BOT_LAST_BROADCAST_UNTIL, BOT_LAST_BROADCAST_OWNER
+
     set_bot_lease(owner, until)
     BOT_LAST_BROADCAST_UNTIL = until if owner else 0
+
+    normalized_owner = owner or None
+    takeover_needed = force_takeover or (normalized_owner != BOT_LAST_BROADCAST_OWNER)
+    if not takeover_needed:
+        return
+
+    BOT_LAST_BROADCAST_OWNER = normalized_owner
+
     peers = [p for p in get_alive_peers() if p.get("node_id") != NODE_ID and p.get("addr")]
     if not peers:
         return
@@ -626,8 +653,9 @@ async def call_rpc(addr: str, method: str, params: Dict[str, Any]) -> Dict[str, 
     payload = {"method": method, "params": params, "ts": now_s()}
     payload["sig"] = make_sig(payload, state["network_secret"])
     url = f"http://{addr}/rpc"
+    client = await ensure_http_client()
     try:
-        async with http_client.post(url, json=payload, timeout=ClientTimeout(total=RPC_TIMEOUT)) as r:
+        async with client.post(url, json=payload, timeout=ClientTimeout(total=RPC_TIMEOUT)) as r:
             return await r.json()
     except Exception as e:
         return {"ok": False, "error": f"rpc_error:{e}"}
@@ -1245,7 +1273,7 @@ async def start_bot():
     BOT_TASK = asyncio.create_task(_run())
 
 async def stop_bot():
-    global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER, BOT_LAST_BROADCAST_UNTIL
+    global BOT, DP, BOT_TASK, BOT_RUN_GEN, BOT_RUNNING_OWNER, BOT_LAST_BROADCAST_UNTIL, BOT_LAST_BROADCAST_OWNER
 
     async with BOT_LOCK:
         if not bot_task_running() and BOT is None and DP is None:
@@ -1289,6 +1317,7 @@ async def stop_bot():
         BOT = None
         BOT_RUNNING_OWNER = None
         BOT_LAST_BROADCAST_UNTIL = 0
+        BOT_LAST_BROADCAST_OWNER = None
 
 async def leader_watcher():
     was_leader = False
@@ -1350,6 +1379,7 @@ async def leader_watcher():
             continue
 
         if owner != NODE_ID or until <= nowt:
+            previous_owner = owner
             acquired = False
             if coord and coord.get("addr"):
                 got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
@@ -1368,7 +1398,12 @@ async def leader_watcher():
                 acquired = True
             if acquired:
                 print(f"[lease] acquired until {until}")
-                await propagate_bot_lease(NODE_ID, until)
+                # Broadcast takeover only if the ownership actually moved to us.
+                await propagate_bot_lease(
+                    NODE_ID,
+                    until,
+                    force_takeover=(previous_owner != NODE_ID),
+                )
                 await asyncio.sleep(0.5)
             else:
                 await asyncio.sleep(1.0)
@@ -1388,6 +1423,7 @@ async def leader_watcher():
                     refreshed = True
                 if refreshed:
                     print(f"[lease] renewed until {until}")
+                    # Silent refresh keeps local state fresh without re-running takeovers.
                     await propagate_bot_lease(NODE_ID, until)
                     await asyncio.sleep(0.5)
 
@@ -1420,8 +1456,7 @@ def parse_listen(addr: str) -> Tuple[str,int]:
     return host, int(port)
 
 async def on_startup(app):
-    global http_client
-    http_client = ClientSession()
+    await ensure_http_client()
     # Если это init-узел, state уже должен содержать network_id/secret/owner
     # Если join — выполним присоединение
     await do_join_if_needed()
@@ -1437,8 +1472,11 @@ async def on_cleanup(app):
     app['lw'].cancel()
     app['telemetry'].cancel()
     await stop_bot()
-    if http_client:
-        await http_client.close()
+    global http_client
+    client = http_client
+    http_client = None
+    if client:
+        await client.close()
 
 def main():
     app = web.Application()
