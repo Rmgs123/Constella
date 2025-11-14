@@ -12,6 +12,11 @@ x-env-defaults: &env_defaults
     NETWORK_SECRET: ${NETWORK_SECRET}
     SEED_PEERS: ${SEED_PEERS}
     JOIN_URL: ${JOIN_URL}
+    VPN_MODE: ${VPN_MODE:-none}
+    VPN_INTERFACE_NAME: ${VPN_INTERFACE_NAME:-wg0}
+    VPN_CIDR: ${VPN_CIDR:-10.42.0.0/24}
+    VPN_LISTEN_PORT: ${VPN_LISTEN_PORT:-}
+    VPN_HUB_ENDPOINT: ${VPN_HUB_ENDPOINT:-}
 
 services:
   constella:
